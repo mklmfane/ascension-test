@@ -1,6 +1,12 @@
 variable "workflow" {
-  description = "Environment name (dev, test, prod). Used for naming & tags."
+  description = "Workflow environment: dev, test, or prod"
   type        = string
+  default     = "dev"
+
+  validation {
+    condition     = contains(["dev", "test", "prod"], var.workflow)
+    error_message = "Workflow must be one of: dev, test, prod."
+  }
 }
 
 variable "location" {

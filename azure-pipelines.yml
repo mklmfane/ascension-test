@@ -27,6 +27,7 @@ stages:
         terraform -version
         cd terraform
         terraform init
+        terraform plan
       displayName: 'Terraform init'
       env:
         ARM_USE_OIDC: "true"

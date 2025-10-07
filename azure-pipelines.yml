@@ -8,7 +8,7 @@ stages:
   jobs:
   - job: plan
     pool:
-      vmImage: 'ubuntu-latest'
+      name: 'ubuntuvm'
     steps:
     - task: AzureCLI@2
       displayName: 'Login with OIDC'

@@ -1,5 +1,8 @@
 trigger: none
 
+variables:
+  serviceConnection: 'terraform-access'   # <- exact service connection NAME
+
 stages:
 - stage: tf
   jobs:
@@ -10,20 +13,23 @@ stages:
     - task: AzureCLI@2
       displayName: 'Login with OIDC'
       inputs:
-        azureSubscription: 'subscription-test-plan'   # your service connection name
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
+        azureSubscription: '$(serviceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
         inlineScript: |
+          # Export ARM_* for the next step from the service connection context
+          echo "##vso[task.setvariable variable=ARM_CLIENT_ID]$servicePrincipalId"
+          echo "##vso[task.setvariable variable=ARM_TENANT_ID]$tenantId"
+          echo "##vso[task.setvariable variable=ARM_SUBSCRIPTION_ID]$subscriptionId"
           az account show
 
     - script: |
         terraform -version
         terraform init
-        terraform plan
+        terraform plan -input=false
       displayName: 'Terraform init/plan'
       env:
         ARM_USE_OIDC: "true"
-        # Optional if provider needs them explicitly; often inferred:
-        ARM_CLIENT_ID: '331a5bcb-b95d-4529-a528-c858e28d9a89'     # from service connection variables
-        ARM_TENANT_ID: '355474d9-f161-4f80-b1ad-3be988c88e00'
-        ARM_SUBSCRIPTION_ID: '2651642d-e8bb-4270-8616-ca051b63d71e'
+        ARM_CLIENT_ID: $(ARM_CLIENT_ID)
+        ARM_TENANT_ID: $(ARM_TENANT_ID)
+        ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)

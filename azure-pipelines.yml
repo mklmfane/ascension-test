@@ -46,56 +46,14 @@ stages:
     - publish: $(Build.SourcesDirectory)/terraform/tfplan.out
       artifact: tfplan-preview
 
-# -------------------------
-# Stage 2: docs (terraform-docs)
-# -------------------------
-- stage: docs
-  displayName: 'Generate Terraform docs'
-  dependsOn: tf
-  jobs:
-  - job: docs
-    pool:
-      name: 'ubuntuvm'
-    steps:
-    - checkout: self
-      clean: true
-      persistCredentials: true   # allows push in Azure Repos with System.AccessToken
-
-    - script: |
-        set -euo pipefail
-        # install terraform-docs if missing
-        if ! command -v terraform-docs >/dev/null 2>&1; then
-          curl -sSfL https://raw.githubusercontent.com/terraform-docs/terraform-docs/main/install.sh | sudo sh -s -- -b /usr/local/bin
-        fi
-        terraform-docs markdown table --output-file README-terraform-resources.md --output-mode inject .
-      displayName: 'Generate README-terraform-resources.md'
-
-    # Commit & push docs (Azure Repos). For GitHub, set a secret variable GH_PAT and uncomment the PAT push block.
-    - script: |
-        set -euo pipefail
-        git config user.name  "azure-pipelines[bot]"
-        git config user.email "azure-pipelines-bot@example.local"
-        git add README-terraform-resources.md || true
-        if git diff --cached --quiet; then
-          echo "No doc changes."
-          exit 0
-        fi
-        # Azure Repos push using System.AccessToken (make sure pipeline setting 'Allow scripts to access the OAuth token' is ON)
-        git commit -m "chore(docs): update terraform docs [skip ci]"
-        git push
-      env:
-        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
-      displayName: 'Commit & push docs (Azure Repos)'
-
 
 # -----------------------------------
-# Stage 3: deploy (matrix dev/test/prod)
+# Stage 2: provision terraform resource (matrix dev/test/prod)
 # -----------------------------------
 - stage: deploy
   displayName: 'Deploy (matrix)'
   dependsOn:
   - tf
-  - docs
   jobs:
   - job: deploy
     pool:

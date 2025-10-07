@@ -72,9 +72,7 @@ stages:
           terraform -chdir="$(Build.SourcesDirectory)/terraform" init -input=false
           terraform -chdir="$(Build.SourcesDirectory)/terraform" validate
           terraform -chdir="$(Build.SourcesDirectory)/terraform" workspace select -or-create "$(TF_WORKFLOW)"
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" plan -input=false \
-            -var="workflow=$(TF_WORKFLOW)" \
-            -out="tfplan.out"
+          terraform -chdir="$(Build.SourcesDirectory)/terraform" plan -input=false -out="tfplan.out"
 
     - publish: $(Build.SourcesDirectory)/terraform/tfplan.out
       artifact: tfplan-preview
@@ -140,9 +138,7 @@ stages:
 
           terraform -chdir="$(Build.SourcesDirectory)/terraform" init -input=false
           terraform -chdir="$(Build.SourcesDirectory)/terraform" workspace select -or-create "$(environment)"
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" plan -input=false \
-            -var="workflow=$(environment)" \
-            -out="tfplan.$(environment).out"
+          terraform -chdir="$(Build.SourcesDirectory)/terraform" plan -input=false -out="tfplan.$(environment).out"
 
     - publish: $(Build.SourcesDirectory)/terraform/tfplan.$(environment).out
       artifact: tfplan-$(environment)
@@ -172,4 +168,4 @@ stages:
           echo "Destroying environment: $(environment)"
           terraform -chdir="$(Build.SourcesDirectory)/terraform" init -input=false
           terraform -chdir="$(Build.SourcesDirectory)/terraform" workspace select -or-create "$(environment)"
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" destroy -auto-approve -var="workflow=$(environment)"
+          terraform -chdir="$(Build.SourcesDirectory)/terraform" destroy -auto-approve"

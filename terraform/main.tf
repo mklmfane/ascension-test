@@ -3,15 +3,15 @@ locals {
   resource_group_name = "ascension-${local.environment}-rg"
 
   # Use your existing base name variable if you have it (var.vnet_name = "vnetone" by default)
-  vnet_name           = "${var.vnet_name}-${local.environment}-vnet"
+  vnet_name           = "ascension-${local.environment}-vnet"
 
   # Pick the environment's dedicated CIDR
   address_space       = var.address_space_by_env[local.environment]
 
-  tags = merge(
-    var.tags,
-    { environment = local.environment }
-  )
+  tags = merge(var.tags,
+    { 
+        environment = local.environment 
+    })
 }
 
 resource "azurerm_resource_group" "ascension_test_rg" {

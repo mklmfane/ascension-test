@@ -1,7 +1,6 @@
 locals {
   environment          = var.workflow
   resource_group_name  = "ascension-${local.environment}-rg"
-  vnet_name            = "${var.vnet_name}-${local.environment}-vnet"
   
   tags = merge(
     var.tags,

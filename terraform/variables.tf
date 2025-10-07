@@ -9,8 +9,21 @@ variable "workflow" {
   }
 }
 
+
 variable "location" {
   description = "Azure region"
   type        = string
   default     = "West Europe" # or "westeurope"
+}
+
+variable "vnet_name" {
+  description = "Base VNet name (env suffix will be added)"
+  type        = string
+  default     = "vnetone"
+}
+
+variable "tags" {
+  description = "Additional resource tags"
+  type        = map(string)
+  default     = {}
 }

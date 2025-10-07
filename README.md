@@ -120,5 +120,3 @@ Be prepared to discuss (even if not fully implemented): multi‑stage promotion,
 ## 11. Compatibility Note
 Use Python 3.11 for the Azure Function locally (other versions may fail to load with current tooling).
 
----
-Good luck — we’re interested in how you think as much as what you build.

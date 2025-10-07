@@ -140,24 +140,24 @@ stages:
 
           terraform -chdir="$(Build.SourcesDirectory)/terraform" init -input=false
           terraform -chdir="$(Build.SourcesDirectory)/terraform" workspace select -or-create "$(environment)"
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" plan -input=false \
+          terraform -chdir="$(Build.SourcesDirectory)/terraform" plan -no-color -input=false \
             -var="workflow=$(environment)" \
             -out="tfplan.$(environment).out"
 
     - publish: $(Build.SourcesDirectory)/terraform/tfplan.$(environment).out
       artifact: tfplan-$(environment)
 
-    # Apply on master only (optional)
+    # Apply on main only
     - task: AzureCLI@2
-      displayName: 'Terraform apply (master only)'
-      condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+      displayName: 'Terraform apply (main only)'
+      condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
       inputs:
         azureSubscription: '$(serviceConnection)'
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |
           set -euo pipefail
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" apply -auto-approve "tfplan.$(environment).out"
+          terraform -chdir="$(Build.SourcesDirectory)/terraform" apply -auto-approve -no-color "tfplan.$(environment).out"
 
     # ---------- FINAL STEP: DESTROY (guarded) ----------
     - task: AzureCLI@2

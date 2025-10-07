@@ -4,43 +4,37 @@ trigger: none
 variables:
   serviceConnection: 'terraform-access'     # EXACT service connection name
   workingDir: '$(Build.SourcesDirectory)/terraform'
-  GO_VERSION: '1.24.5'                      # Go for tfsec install
-  TFSEC_VERSION: 'v0.63.1'                  # pin as per docs (or 'latest')
-  TFLINT_VERSION: 'v0.50.3'                 # choose a stable release
+  GO_VERSION: '1.24.5'
+  TFSEC_VERSION: 'v1.28.14'                  # or 'latest'
+  TFLINT_VERSION: 'v0.59.1'
+  doDestroy: 'false'                        # flip to 'true' to enable final destroy
 
 stages:
-# --------------------------------
-# Stage 1: TF plan (preview)
-# --------------------------------
+# -------- TF plan (preview) --------
 - stage: tf
   displayName: 'TF plan (preview)'
   jobs:
   - job: plan
-    pool:
-      name: 'ubuntuvm'                      # your self-hosted agent pool
+    pool: { name: 'ubuntuvm' }
     steps:
     - checkout: self
       clean: true
 
-    # Login and run everything in ONE step so OIDC auth is active
+    # (kept) Login + lint + plan in one step
     - task: AzureCLI@2
       displayName: 'Login with OIDC + install Go/tfsec + tflint + plan'
       inputs:
-        azureSubscription: '$(serviceConnection)'   # <-- indispensable part kept
+        azureSubscription: '$(serviceConnection)'   # <- indispensable
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |
           set -euo pipefail
-          echo "== Using service connection context =="
           az account show
 
-          # user-writable bin (no sudo) and PATH
-          BIN_DIR="$(Agent.TempDirectory)/bin"
-          mkdir -p "$BIN_DIR"
-          export PATH="$BIN_DIR:$PATH"
+          BIN_DIR="$(Agent.TempDirectory)/bin"; mkdir -p "$BIN_DIR"; export PATH="$BIN_DIR:$PATH"
 
-          echo "== Install Go locally (no sudo) =="
-          if ! command -v go >/dev/null 2>&1; then
+          # Go (no sudo)
+          if ! command -v go >/dev/null; then
             GO_TGZ="go$(GO_VERSION).linux-amd64.tar.gz"
             curl -sSL "https://go.dev/dl/${GO_TGZ}" -o "${GO_TGZ}"
             tar -C "$(Agent.TempDirectory)" -xzf "${GO_TGZ}"
@@ -50,33 +44,29 @@ stages:
             mkdir -p "$GOPATH"
             export PATH="$GOROOT/bin:$GOBIN:$GOPATH/bin:$PATH"
           else
-            export GOBIN="$BIN_DIR"
-            export GOPATH="$(Agent.TempDirectory)/gopath"
-            export PATH="$GOBIN:$GOPATH/bin:$PATH"
+            export GOBIN="$BIN_DIR"; export GOPATH="$(Agent.TempDirectory)/gopath"; export PATH="$GOBIN:$GOPATH/bin:$PATH"
           fi
           go version
 
-          echo "== Install tfsec via Go =="
-          if ! command -v tfsec >/dev/null 2>&1; then
+          # tfsec via go
+          if ! command -v tfsec >/dev/null; then
             go install "github.com/aquasecurity/tfsec/cmd/tfsec@${TFSEC_VERSION}"
           fi
           tfsec --version
 
-          echo "== Install tflint to user bin (no sudo) =="
-          if ! command -v tflint >/dev/null 2>&1; then
+          # tflint (no sudo)
+          if ! command -v tflint >/dev/null; then
             TMP="$(mktemp -d)"
             curl -sSL "https://github.com/terraform-linters/tflint/releases/download/${TFLINT_VERSION}/tflint_linux_amd64.zip" -o "${TMP}/tflint.zip"
             unzip -q "${TMP}/tflint.zip" -d "${TMP}"
             install -m 0755 "${TMP}/tflint" "${BIN_DIR}/tflint"
-            tflint --version
           fi
 
-          echo "== Linting (non-fatal for tfsec) =="
+          # lint + plan
           tflint --init
           tflint --recursive
           tfsec "$(Build.SourcesDirectory)/terraform" || true
 
-          echo "== Terraform plan (preview) =="
           terraform -version
           terraform -chdir="$(Build.SourcesDirectory)/terraform" init -input=false
           terraform -chdir="$(Build.SourcesDirectory)/terraform" validate
@@ -84,26 +74,19 @@ stages:
 
     - publish: $(Build.SourcesDirectory)/terraform/tfplan.out
       artifact: tfplan-preview
-      displayName: 'Publish TF plan (preview)'
 
-# --------------------------------
-# Stage 2: Deploy (matrix)
-# --------------------------------
+# -------- Deploy (matrix) --------
 - stage: deploy
   displayName: 'Deploy (matrix)'
   dependsOn: tf
   jobs:
   - job: deploy
-    pool:
-      name: 'ubuntuvm'
+    pool: { name: 'ubuntuvm' }
     strategy:
       matrix:
-        dev:
-          environment: dev
-        test:
-          environment: test
-        prod:
-          environment: prod
+        dev:  { environment: dev }
+        test: { environment: test }
+        prod: { environment: prod }
     steps:
     - checkout: self
       clean: true
@@ -119,13 +102,10 @@ stages:
           echo "Environment: $(environment)"
           az account show
 
-          # user-writable bin and PATH
-          BIN_DIR="$(Agent.TempDirectory)/bin"
-          mkdir -p "$BIN_DIR"
-          export PATH="$BIN_DIR:$PATH"
+          BIN_DIR="$(Agent.TempDirectory)/bin"; mkdir -p "$BIN_DIR"; export PATH="$BIN_DIR:$PATH"
 
-          # Go (for tfsec)
-          if ! command -v go >/dev/null 2>&1; then
+          # Go + tfsec
+          if ! command -v go >/dev/null; then
             GO_TGZ="go$(GO_VERSION).linux-amd64.tar.gz"
             curl -sSL "https://go.dev/dl/${GO_TGZ}" -o "${GO_TGZ}"
             tar -C "$(Agent.TempDirectory)" -xzf "${GO_TGZ}"
@@ -135,25 +115,21 @@ stages:
             mkdir -p "$GOPATH"
             export PATH="$GOROOT/bin:$GOBIN:$GOPATH/bin:$PATH"
           else
-            export GOBIN="$BIN_DIR"
-            export GOPATH="$(Agent.TempDirectory)/gopath"
-            export PATH="$GOBIN:$GOPATH/bin:$PATH"
+            export GOBIN="$BIN_DIR"; export GOPATH="$(Agent.TempDirectory)/gopath"; export PATH="$GOBIN:$GOPATH/bin:$PATH"
           fi
-
-          # tfsec via go
-          if ! command -v tfsec >/dev/null 2>&1; then
+          if ! command -v tfsec >/dev/null; then
             go install "github.com/aquasecurity/tfsec/cmd/tfsec@${TFSEC_VERSION}"
           fi
 
-          # tflint to BIN_DIR
-          if ! command -v tflint >/dev/null 2>&1; then
+          # tflint
+          if ! command -v tflint >/dev/null; then
             TMP="$(mktemp -d)"
             curl -sSL "https://github.com/terraform-linters/tflint/releases/download/${TFLINT_VERSION}/tflint_linux_amd64.zip" -o "${TMP}/tflint.zip"
             unzip -q "${TMP}/tflint.zip" -d "${TMP}"
             install -m 0755 "${TMP}/tflint" "${BIN_DIR}/tflint"
           fi
 
-          # Lint & Plan
+          # lint + plan per env
           tflint --init
           tflint --recursive
           tfsec "$(Build.SourcesDirectory)/terraform" || true
@@ -167,7 +143,7 @@ stages:
     - publish: $(Build.SourcesDirectory)/terraform/tfplan.$(environment).out
       artifact: tfplan-$(environment)
 
-    # apply on master only (optional)
+    # Apply on master only (adjust as you like)
     - task: AzureCLI@2
       displayName: 'Terraform apply (master only)'
       condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
@@ -178,3 +154,18 @@ stages:
         inlineScript: |
           set -euo pipefail
           terraform -chdir="$(Build.SourcesDirectory)/terraform" apply -auto-approve "tfplan.$(environment).out"
+
+    # ---------- FINAL STEP: DESTROY (guarded) ----------
+    - task: AzureCLI@2
+      displayName: 'Terraform destroy (guarded by variable)'
+      condition: and(succeeded(), eq(variables['doDestroy'], 'true'))
+      inputs:
+        azureSubscription: '$(serviceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+          echo "Destroying environment: $(environment)"
+          terraform -chdir="$(Build.SourcesDirectory)/terraform" init -input=false
+          terraform -chdir="$(Build.SourcesDirectory)/terraform" workspace select -or-create "$(environment)"
+          terraform -chdir="$(Build.SourcesDirectory)/terraform" destroy -auto-approve -var="workflow=$(environment)"

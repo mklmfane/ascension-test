@@ -2,89 +2,75 @@
 trigger: none
 
 variables:
-  serviceConnection: 'terraform-access'     # EXACT service connection name
+  serviceConnection: 'terraform-access'    # EXACT service connection name
   workingDir: '$(Build.SourcesDirectory)/terraform'
-  doDestroy: 'false'                        # set to 'true' to enable destroy step
+  GO_VERSION: '1.24.5'                     # pin Go; change as you like (1.22.x+)
 
-# -------------------------
-# Stage 1: tf (plan preview)
-# -------------------------
 stages:
 - stage: tf
-  displayName: 'TF plan (preview)'
   jobs:
   - job: plan
     pool:
-      name: 'ubuntuvm'                      # your self-hosted agent pool
+      name: 'ubuntuvm'
     steps:
     - checkout: self
       clean: true
 
-    # (inside your existing stage)
+    # Login and run everything in ONE step so OIDC auth is active
     - task: AzureCLI@2
-      displayName: 'Login with OIDC + tools + lint'
+      displayName: 'Login with OIDC + install Go + tfsec (via go) + tflint + plan'
       inputs:
-        azureSubscription: '$(serviceConnection)'   # <- keep this
+        azureSubscription: '$(serviceConnection)'   # <-- indispensable part preserved
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |
           set -euo pipefail
-          echo "Environment: $(environment)"
+          echo "Environment: ${environment:-dev}"
 
-          # Create a user-writable bin and add to PATH
+          # User-writable bin; avoid sudo
           BIN_DIR="$(Agent.TempDirectory)/bin"
           mkdir -p "$BIN_DIR"
           export PATH="$BIN_DIR:$PATH"
 
-          az account show
-          terraform -version
+          # --- Install Go locally (no sudo) ---
+          if ! command -v go >/dev/null 2>&1; then
+            GO_TGZ="go$(GO_VERSION).linux-amd64.tar.gz"
+            curl -sSL "https://go.dev/dl/${GO_TGZ}" -o "${GO_TGZ}"
+            tar -C "$(Agent.TempDirectory)" -xzf "${GO_TGZ}"
+            export GOROOT="$(Agent.TempDirectory)/go"
+            export GOPATH="$(Agent.TempDirectory)/gopath"
+            export GOBIN="$BIN_DIR"
+            mkdir -p "$GOPATH"
+            export PATH="$GOROOT/bin:$GOBIN:$GOPATH/bin:$PATH"
+          else
+            # Ensure go-installed binaries land in our BIN_DIR
+            export GOBIN="$BIN_DIR"
+            export GOPATH="$(Agent.TempDirectory)/gopath"
+            export PATH="$GOBIN:$GOPATH/bin:$PATH"
+          fi
+          go version
 
-          # --- install TFLint (no sudo) ---
+          # --- Install tfsec via Go (per docs) ---
+          if ! command -v tfsec >/dev/null 2>&1; then
+            # Pin a version if you want, e.g. @v0.63.1 ; otherwise @latest
+            go install github.com/aquasecurity/tfsec/cmd/tfsec@latest
+          fi
+          tfsec --version
+
+          # --- Install TFLint without sudo ---
           if ! command -v tflint >/dev/null 2>&1; then
             curl -sSL https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh \
-          | bash -s -- -b "$BIN_DIR"
+              | bash -s -- -b "$BIN_DIR"
           fi
           tflint --init
           tflint --recursive
 
-          # --- install tfsec (no sudo) ---
-          if ! command -v tfsec >/dev/null 2>&1; then
-            curl -sSL https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh \
-          | bash -s -- -b "$BIN_DIR"
-          fi
-          # Don’t fail the pipeline on tfsec findings by default
-          tfsec "$(Build.SourcesDirectory)/terraform" || true
-
-          # Terraform
+          # --- Terraform plan ---
+          terraform -version
           terraform -chdir="$(Build.SourcesDirectory)/terraform" init -input=false
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" workspace select -or-create "$(environment)"
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" plan -input=false \
-            -var="workflow=$(environment)" \
-            -out="tfplan.$(environment).out"
+          terraform -chdir="$(Build.SourcesDirectory)/terraform" validate
+          terraform -chdir="$(Build.SourcesDirectory)/terraform" plan -input=false -out="tfplan.out"
 
-    - publish: $(Build.SourcesDirectory)/terraform/tfplan.$(environment).out
-      artifact: tfplan-$(environment)
-
-    # Apply only on master branch (adjust as needed)
-    - task: AzureCLI@2
-      displayName: 'Terraform apply (master only)'
-      condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
-      inputs:
-        azureSubscription: '$(serviceConnection)'
-        scriptType: bash
-        scriptLocation: inlineScript
-        inlineScript: |
-          set -euo pipefail
-          terraform -chdir=$(Build.SourcesDirectory)/terraform apply -auto-approve "tfplan.$(environment).out"
-
-    # Optional destroy (guarded by variable)
-    - task: AzureCLI@2
-      displayName: 'Terraform destroy (if enabled)'
-      condition: and(succeeded(), eq(variables['doDestroy'], 'true'))
-      inputs:
-        azureSubscription: '$(serviceConnection)'
-        scriptType: bash
-        scriptLocation: inlineScript
-        inlineScript: |
-          set -euo pipefail
-          terraform -chdir=$(Build.SourcesDirectory)/terraform destroy -auto-approve -var="workflow=$(environment)"
+    - publish: $(Build.SourcesDirectory)/terraform/tfplan.out
+      artifact: tfplan
+      displayName: 'Publish TF plan'

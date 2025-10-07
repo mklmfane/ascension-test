@@ -1,0 +1,29 @@
+trigger: none
+
+stages:
+- stage: tf
+  jobs:
+  - job: plan
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Login with OIDC'
+      inputs:
+        azureSubscription: 'subscription-test-plan'   # your service connection name
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az account show
+
+    - script: |
+        terraform -version
+        terraform init
+        terraform plan
+      displayName: 'Terraform init/plan'
+      env:
+        ARM_USE_OIDC: "true"
+        # Optional if provider needs them explicitly; often inferred:
+        ARM_CLIENT_ID: $(servicePrincipalId)     # from service connection variables
+        ARM_TENANT_ID: $(tenantId)
+        ARM_SUBSCRIPTION_ID: $(subscriptionId)

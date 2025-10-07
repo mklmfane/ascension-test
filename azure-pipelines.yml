@@ -1,37 +1,29 @@
+# azure-pipelines.yml
 trigger: none
 
 variables:
-  serviceConnection: 'terraform-access'   # <- exact service connection NAME
-
+  serviceConnection: 'terraform-access'   # EXACT service connection name
 
 stages:
 - stage: tf
   jobs:
   - job: plan
     pool:
-      name: 'ubuntuvm'
+      name: 'ubuntuvm'                    # your self-hosted agent pool
     steps:
+    - checkout: self
+      clean: true
+
+    # Login and run terraform in the same step
     - task: AzureCLI@2
-      displayName: 'Login with OIDC'
+      displayName: 'Login with OIDC and terraform plan'
       inputs:
         azureSubscription: '$(serviceConnection)'
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |
-          # Export ARM_* for the next step from the service connection context
-          echo "##vso[task.setvariable variable=ARM_CLIENT_ID]$servicePrincipalId"
-          echo "##vso[task.setvariable variable=ARM_TENANT_ID]$tenantId"
-          echo "##vso[task.setvariable variable=ARM_SUBSCRIPTION_ID]$subscriptionId"
-          az account show
-    - script: |
-        terraform -version
-        cd terraform
-        terraform init
-        terraform plan
-      displayName: 'Terraform init'
-      env:
-        ARM_USE_OIDC: "true"
-        ARM_CLIENT_ID: $(ARM_CLIENT_ID)
-        ARM_TENANT_ID: $(ARM_TENANT_ID)
-        ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
-      workingDirectory: $(Build.SourcesDirectory) 
+          set -euo pipefail
+          terraform -version
+          terraform -chdir=terraform init -input=false
+          terraform -chdir=terraform validate
+          terraform -chdir=terraform plan -input=false -out=tfplan.out

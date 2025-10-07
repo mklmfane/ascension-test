@@ -9,6 +9,17 @@ variable "workflow" {
   }
 }
 
+# NEW: per-environment CIDRs so dev/test/prod don't overlap
+variable "address_space_by_env" {
+  description = "VNet CIDR per environment."
+  type        = map(list(string))
+  default = {
+    dev  = ["10.10.0.0/16"]
+    test = ["10.20.0.0/16"]
+    prod = ["10.30.0.0/16"]
+  }
+}
+
 variable "location" {
   description = "Azure region"
   type        = string

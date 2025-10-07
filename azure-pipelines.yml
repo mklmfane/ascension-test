@@ -8,7 +8,7 @@ variables:
   TFSEC_VERSION: 'v1.28.14'                 # or 'latest'
   TFLINT_VERSION: 'v0.59.1'
   doDestroy: 'false'                        # flip to 'true' to enable final destroy
-  TF_WORKFLOW: 'preview'                    # <-- used in the TF preview stage
+  TF_WORKFLOW: 'dev'                    # <-- used in the TF preview stage
 
 stages:
 # -------- TF plan (preview) --------

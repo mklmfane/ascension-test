@@ -5,9 +5,10 @@ variables:
   serviceConnection: 'terraform-access'     # EXACT service connection name
   workingDir: '$(Build.SourcesDirectory)/terraform'
   GO_VERSION: '1.24.5'
-  TFSEC_VERSION: 'v1.28.14'                  # or 'latest'
+  TFSEC_VERSION: 'v1.28.14'                 # or 'latest'
   TFLINT_VERSION: 'v0.59.1'
   doDestroy: 'false'                        # flip to 'true' to enable final destroy
+  TF_WORKFLOW: 'preview'                    # <-- used in the TF preview stage
 
 stages:
 # -------- TF plan (preview) --------
@@ -62,7 +63,7 @@ stages:
             install -m 0755 "${TMP}/tflint" "${BIN_DIR}/tflint"
           fi
 
-          # lint + plan
+          # lint + plan (preview workspace/var)
           tflint --init
           tflint --recursive
           tfsec "$(Build.SourcesDirectory)/terraform" || true
@@ -70,7 +71,10 @@ stages:
           terraform -version
           terraform -chdir="$(Build.SourcesDirectory)/terraform" init -input=false
           terraform -chdir="$(Build.SourcesDirectory)/terraform" validate
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" plan -input=false -out="tfplan.out"
+          terraform -chdir="$(Build.SourcesDirectory)/terraform" workspace select -or-create "$(TF_WORKFLOW)"
+          terraform -chdir="$(Build.SourcesDirectory)/terraform" plan -input=false \
+            -var="workflow=$(TF_WORKFLOW)" \
+            -out="tfplan.out"
 
     - publish: $(Build.SourcesDirectory)/terraform/tfplan.out
       artifact: tfplan-preview
@@ -143,7 +147,7 @@ stages:
     - publish: $(Build.SourcesDirectory)/terraform/tfplan.$(environment).out
       artifact: tfplan-$(environment)
 
-    # Apply on master only (adjust as you like)
+    # Apply on master only (optional)
     - task: AzureCLI@2
       displayName: 'Terraform apply (master only)'
       condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))

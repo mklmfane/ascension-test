@@ -193,11 +193,10 @@ stages:
           terraform -chdir="$(Build.SourcesDirectory)/terraform" init -input=false
           terraform -chdir="$(Build.SourcesDirectory)/terraform" workspace select -or-create "$(environment)"
  
- 
           terraform -chdir="$(Build.SourcesDirectory)/terraform" plan -no-color -input=false \
             -var="workflow=$(TF_WORKFLOW)" \
             -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
-            -out="tfplan.out"
+            -out="tfplan.$(environment).out"
 
     - publish: $(Build.SourcesDirectory)/terraform/tfplan.$(environment).out
       artifact: tfplan-$(environment)

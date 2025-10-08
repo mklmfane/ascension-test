@@ -9,6 +9,8 @@ variables:
   RG_NAME_PREFIX: 'ascension-up'
   location: 'northeurope'
 
+
+stages:
 # =========================
 # DEV STAGE (build -> infra -> apps)
 # =========================

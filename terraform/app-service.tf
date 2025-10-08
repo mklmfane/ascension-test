@@ -3,18 +3,14 @@
 locals {
   #Subnet integration CIDR
   subnet_integ_cidr   = var.subnet_integration_cidr_by_env[local.environment]
-
-    # Pick the environment's dedicated CIDR
-  #vnet_address_space       = var.address_space_by_env[local.environment]
-
 }
 
 module "app_service" {
   source                     = "./modules/app-service"
 
   environment                = local.environment
-  resource_group_location    = azurerm_resource_group.ascension_test_rg.location
-  resource_group_name        = azurerm_resource_group.ascension_test_rg.name
+  resource_group_location    = local.rg_location
+  resource_group_name        = local.rg_name
 
   vnet_virtual_network_name  = azurerm_virtual_network.vnet.name
   #vnet_address_space         = local.vnet_address_space        

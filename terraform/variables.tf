@@ -20,10 +20,17 @@ variable "address_space_by_env" {
   }
 }
 
+# If true -> create RG; if false -> use an existing RG with the same name
+variable "create_rg" { 
+  description = "Validate if resoruce group exists"
+  type = bool  
+  default = true 
+}
+
 variable "location" {
   description = "Azure region"
   type        = string
-  default     = "North Europe" # or "westeurope"
+  default     = "North Europe"
 }
 
 

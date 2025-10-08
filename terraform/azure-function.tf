@@ -6,8 +6,8 @@ module "function_python" {
   source                        = "./modules/function_python"
 
   environment                   = local.environment
-  location                      = azurerm_resource_group.ascension_test_rg.location
-  resource_group_name           = azurerm_resource_group.ascension_test_rg.name
+  location                      = local.rg_location
+  resource_group_name           = local.rg_name
 
   # Reuse plan & networking from app_service module (this is the dependency!)
   create_new_plan               = false
@@ -16,8 +16,8 @@ module "function_python" {
 
   application_insights_conn_str = module.app_service.app_insights_connection_string
   key_vault_id                  = module.app_service.key_vault_id
-
   func_plan_sku                 = var.func_plan_sku
+  
   tags                          = local.tags
 
   depends_on = [module.app_service]

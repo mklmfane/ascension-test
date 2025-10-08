@@ -289,6 +289,7 @@ stages:
           else
             echo "Not main branch, skipping apply."
           fi
+
     - publish: $(Build.SourcesDirectory)/terraform/tf-outputs.$(env).json
       artifact: tf-outputs-$(env)
       condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))

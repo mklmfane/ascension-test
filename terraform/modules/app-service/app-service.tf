@@ -5,8 +5,6 @@ resource "random_string" "kv_suffix" {
 }
 
 locals {
-
-
   env               = var.environment
   subnet_integ_name   = "snet-${local.env}-integration"
 
@@ -20,7 +18,6 @@ locals {
 }
 
 data "azurerm_client_config" "current" {}
-
 
 
 # ---------------------------

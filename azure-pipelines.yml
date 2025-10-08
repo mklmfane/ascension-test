@@ -160,15 +160,23 @@ stages:
         condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
         displayName: 'Publish tf-outputs'
 
+
   # ---- dev_func_local_test ----
   - job: dev_func_local_test
-    displayName: 'Azure Function: venv + func start + curl + pytest'
+    displayName: 'Azure Function: venv (py3.11) + func start + curl + pytest'
     pool: { name: 'ubuntuvm' }
     steps:
       - checkout: self
         clean: true
 
-      # Node is needed for Core Tools v4 (host shell + proxies)
+      # Ensure we run Python 3.11 (Functions v4 supports 3.11; your agent has 3.13)
+      - task: UsePythonVersion@0
+        displayName: 'Use Python 3.11'
+        inputs:
+          versionSpec: '3.11'
+          addToPath: true
+
+      # Node is needed by Core Tools
       - task: NodeTool@0
         displayName: 'Use Node 18.x'
         inputs:
@@ -181,60 +189,66 @@ stages:
           set -euo pipefail
           cd "$(Build.SourcesDirectory)/api-function"
 
-          echo "Python version:"
-          python3 --version || true
+          echo "Python selected by UsePythonVersion:"
+          which python
+          python --version
 
-          # --- Create venv + deps ---
-          python3 -m venv .venv
+          # --- Create venv with the pinned 3.11 interpreter ---
+          # $(pythonLocation) is set by UsePythonVersion@0
+          "${pythonLocation}/bin/python" -m venv .venv
           source .venv/bin/activate
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-          # Required so 'from Products import main' works when running pytest
+          # Make 'from Products import main' imports resolve when running pytest/host
           export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 
-          # --- local.settings.json ---
-          cp -f local.settings.example.json local.settings.json
+          # Ensure local.settings.json exists and has FUNCTIONS_WORKER_RUNTIME=python
+          if [ ! -f local.settings.json ]; then
+            if [ -f local.settings.example.json ]; then
+              cp -f local.settings.example.json local.settings.json
+            else
+              cat > local.settings.json <<'JSON'
+              {
+                "IsEncrypted": false,
+                "Values": {
+                  "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+                  "FUNCTIONS_WORKER_RUNTIME": "python"
+                }
+              }
+              JSON
+            fi
+          fi
 
-          # --- Start Functions host in background (verbose) ---
+          # --- Start Functions host in background (verbose) with IPv4 ---
           LOG_FILE="$(Build.SourcesDirectory)/.func.log"
           PID_FILE="$(Build.SourcesDirectory)/.func.pid"
-          # prefer IPv4 to avoid ::1 races on some agents
           nohup func start --python --port 7071 --verbose > "$LOG_FILE" 2>&1 & echo $! > "$PID_FILE"
 
           echo "Functions host starting (PID $(cat "$PID_FILE")). Waiting for readiness..."
-
-          # Wait until either the port is open OR the log says host started
           ready=0
           for i in {1..90}; do
-            # check port
-            if curl -fsS "http://127.0.0.1:7071/admin/host/status" >/dev/null 2>&1; then
-              ready=1; break
-            fi
-            # check log message
-            if grep -qE 'Host started|Job host started' "$LOG_FILE" 2>/dev/null; then
-              ready=1; break
-            fi
-            sleep 2
+            # check admin status endpoint (avoids race on ::1)
+            if curl -fsS "http://127.0.0.1:7071/admin/host/status" >/dev/null 2>&1; then ready=1; break; fi
+            # or look for the startup log line
+            if grep -qE 'Host started|Job host started' "$LOG_FILE" 2>/dev/null; then ready=1; break; fi
+              sleep 2
           done
 
           if [ "$ready" -ne 1 ]; then
             echo "ERROR: Functions host did not become ready. Last 200 log lines:"
             tail -n 200 "$LOG_FILE" || true
-            # ensure we stop the background process before failing
             if [ -f "$PID_FILE" ]; then kill "$(cat "$PID_FILE")" || true; fi
               pkill -f "func start" || true
               exit 1
-            fi
+          fi
 
-          # --- Smoke test the HTTP function ---
           echo "Smoke test /api/products:"
           curl -v "http://127.0.0.1:7071/api/products" || true
 
-          # --- Run tests inside repo folder so relative imports work ---
           echo "Running pytest…"
           pytest -q
-        displayName: 'Create venv, start func, smoke-test endpoint, run pytest'
+        displayName: 'Create venv (py3.11), start func, smoke-test, pytest'
 
       - bash: |
           set -euo pipefail
@@ -263,7 +277,7 @@ stages:
         clean: true
 
       # ACR login server from Terraform outputs is needed to build & push container
-      - download: current
+      - download: current-terraform-state-output
         artifact: tf-outputs-$(env)
 
       - task: AzureCLI@2

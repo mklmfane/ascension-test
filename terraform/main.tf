@@ -1,12 +1,12 @@
 locals {
   environment         = var.workflow
-  resource_group_name = "ascension-${local.environment}-rg"
+  resource_group_name = "ascension-up-${local.environment}-rg"
 
   # Use your existing base name variable if you have it (var.vnet_name = "vnetone" by default)
-  vnet_name           = "ascension-${local.environment}-vnet"
+  vnet_name           = "ascension-up-${local.environment}-vnet"
 
   # Pick the environment's dedicated CIDR
-  address_space       = var.address_space_by_env[local.environment]
+  vnet_address_space       = var.address_space_by_env[local.environment]
 
   tags = merge(var.tags,
     { 
@@ -16,14 +16,15 @@ locals {
 
 resource "azurerm_resource_group" "ascension_test_rg" {
   name     = local.resource_group_name
+  
   location = var.location
   tags     = local.tags
 }
 
-resource "azurerm_virtual_network" "azure_vnet_one" {
+resource "azurerm_virtual_network" "vnet" {
   name                = local.vnet_name
-  resource_group_name = azurerm_resource_group.ascension_test_rg.name
   location            = azurerm_resource_group.ascension_test_rg.location
-  address_space       = local.address_space
+  resource_group_name = azurerm_resource_group.ascension_test_rg.name
+  address_space       = local.vnet_address_space
   tags                = local.tags
 }

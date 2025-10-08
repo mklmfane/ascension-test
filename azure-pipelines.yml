@@ -72,19 +72,25 @@ stages:
           terraform -chdir="$(Build.SourcesDirectory)/terraform" init -input=false
           terraform -chdir="$(Build.SourcesDirectory)/terraform" validate
           terraform -chdir="$(Build.SourcesDirectory)/terraform" workspace select -or-create "$(TF_WORKFLOW)"
+          
+          SC_CLIENT_ID="331a5bcb-b95d-4529-a528-c858e28d9a89"
+          # -> Object ID (this is what principal_id needs)
+          PIPELINE_PRINCIPAL_OBJECT_ID=$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)
+          echo "$PIPELINE_PRINCIPAL_OBJECT_ID"
           terraform -chdir="$(Build.SourcesDirectory)/terraform" plan -input=false \
             -var="workflow=$(TF_WORKFLOW)" \
+            -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
             -out="tfplan.out"
 
     - publish: $(Build.SourcesDirectory)/terraform/tfplan.out
       artifact: tfplan-preview
 
 # -------- Deploy (matrix) --------
-- stage: deploy
+- stage: deploy_infra
   displayName: 'Deploy (matrix)'
   dependsOn: tf
   jobs:
-  - job: deploy
+  - job: deploy_infra
     pool: { name: 'ubuntuvm' }
     strategy:
       matrix:
@@ -133,6 +139,10 @@ stages:
             install -m 0755 "${TMP}/tflint" "${BIN_DIR}/tflint"
           fi
 
+          SC_CLIENT_ID="331a5bcb-b95d-4529-a528-c858e28d9a89" # -> Object ID (this is what principal_id needs)
+          PIPELINE_PRINCIPAL_OBJECT_ID=$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)
+          echo "$PIPELINE_PRINCIPAL_OBJECT_ID" 
+
           # lint + plan per env
           tflint --init
           tflint --recursive
@@ -140,9 +150,12 @@ stages:
 
           terraform -chdir="$(Build.SourcesDirectory)/terraform" init -input=false
           terraform -chdir="$(Build.SourcesDirectory)/terraform" workspace select -or-create "$(environment)"
+ 
+ 
           terraform -chdir="$(Build.SourcesDirectory)/terraform" plan -no-color -input=false \
-            -var="workflow=$(environment)" \
-            -out="tfplan.$(environment).out"
+            -var="workflow=$(TF_WORKFLOW)" \
+            -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
+            -out="tfplan.out"
 
     - publish: $(Build.SourcesDirectory)/terraform/tfplan.$(environment).out
       artifact: tfplan-$(environment)
@@ -159,17 +172,97 @@ stages:
           set -euo pipefail
           terraform -chdir="$(Build.SourcesDirectory)/terraform" apply -auto-approve -no-color "tfplan.$(environment).out"
 
-    # ---------- FINAL STEP: DESTROY (guarded) ----------
-    - task: AzureCLI@2
-      displayName: 'Terraform destroy (guarded by variable)'
-      condition: and(succeeded(), eq(variables['doDestroy'], 'true'))
-      inputs:
-        azureSubscription: '$(serviceConnection)'
-        scriptType: bash
-        scriptLocation: inlineScript
-        inlineScript: |
-          set -euo pipefail
-          echo "Destroying environment: $(environment)"
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" init -input=false
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" workspace select -or-create "$(environment)"
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" destroy -auto-approve -var="workflow=$(environment)"
+
+# =========================
+# APP DEPLOY (matrix envs)
+# =========================
+- stage: deploy_apps
+  displayName: "Deploy frontend & function (matrix)"
+  dependsOn:
+    - build
+    - deploy_infra
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - job: deploy_apps
+    pool: { name: 'ubuntuvm' }
+    strategy:
+      matrix:
+        dev:  { environment: dev }
+        test: { environment: test }
+        prod: { environment: prod }
+    steps:
+      - download: current
+        artifact: frontend
+      - download: current
+        artifact: function
+      - download: current
+        artifact: tf-outputs-$(environment)
+
+      - task: AzureCLI@2
+        displayName: "Login + deploy both apps"
+        inputs:
+          azureSubscription: '$(serviceConnection)'
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
+
+            FRONTEND_ZIP="$(Pipeline.Workspace)/frontend/frontend.zip"
+            FUNCTION_ZIP="$(Pipeline.Workspace)/function/function.zip"
+            TF_OUT="$(Pipeline.Workspace)/tf-outputs-$(environment)/tf-outputs.$(environment).json"
+
+            # jq not guaranteed on self-hosted; use Python (preinstalled on ubuntu)
+            RG=$(python -c "import json,sys;print(json.load(open('$TF_OUT'))['resource_group_name']['value'])")
+            WEB=$(python -c "import json,sys;print(json.load(open('$TF_OUT'))['react_web_name']['value'])")
+            FN=$(python -c "import json,sys;print(json.load(open('$TF_OUT'))['function_name']['value'])")
+
+            echo "RG=$RG WEB=$WEB FN=$FN"
+
+            # Frontend deploy (zip)
+            az webapp deployment source config-zip -g "$RG" -n "$WEB" --src "$FRONTEND_ZIP"
+
+            # Ensure remote build for Python Function
+            az functionapp config appsettings set -g "$RG" -n "$FN" --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true
+
+            # Function deploy (zip)
+            az functionapp deployment source config-zip -g "$RG" -n "$FN" --src "$FUNCTION_ZIP"
+
+            # Optional: tiny smoke check (won't fail the job)
+            FN_URL="https://${FN}.azurewebsites.net/api/products"
+            curl -fsS "$FN_URL" || true
+
+# =========================
+# DESTROY (last, guarded)
+# =========================
+- stage: destroy
+  displayName: "Terraform destroy (guarded)"
+  dependsOn:
+    - build
+    - tf
+    - deploy_infra
+    - deploy_apps
+  condition: and(succeeded(), eq(variables['doDestroy'], 'true'))
+  jobs:
+  - job: destroy_by_env
+    displayName: "Destroy infra per environment"
+    pool: { name: 'ubuntuvm' }
+    strategy:
+      matrix:
+        dev:  { environment: dev }
+        test: { environment: test }
+        prod: { environment: prod }
+    steps:
+      - checkout: self
+        clean: true
+
+      - task: AzureCLI@2
+        displayName: "Terraform destroy $(environment)"
+        inputs:
+          azureSubscription: '$(serviceConnection)'
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
+            terraform -chdir="$(Build.SourcesDirectory)/terraform" init -input=false
+            terraform -chdir="$(Build.SourcesDirectory)/terraform" workspace select -or-create "$(environment)"
+            terraform -chdir="$(Build.SourcesDirectory)/terraform" destroy -no-color -auto-approve -var="workflow=$(environment)"

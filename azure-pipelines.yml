@@ -11,10 +11,7 @@ variables:
   TF_WORKFLOW: 'dev'                    # <-- used in the TF preview stage
 
 stages:
-
-#Build stage to build and publish artifacts for frontend and function apps
-# ---------- BUILD (produces artifacts used by deploy_apps) ----------
-# ---------- BUILD (produces artifacts used by deploy_apps) ----------
+# ---------- BUILD (produces artifacts used by deploy_apps) for frontend and function apps
 - stage: build
   displayName: 'Build & package apps'
   jobs:
@@ -51,7 +48,7 @@ stages:
 
     - publish: $(Build.ArtifactStagingDirectory)/frontend
       artifact: frontend
-      
+
     - publish: $(Build.ArtifactStagingDirectory)/function
       artifact: function
 

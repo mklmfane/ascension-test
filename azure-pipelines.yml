@@ -219,33 +219,50 @@ stages:
           export PATH="$HOME/.npm-global/bin:$PATH"
           cd "$(Build.SourcesDirectory)/api-function"
 
-          # venv + deps with resolved interpreter
+          # --- Force Python 3.11 (Functions v4 support) ---
+          if command -v python3.11 >/dev/null 2>&1; then
+            PY="$(command -v python3.11)"
+          else
+            echo "ERROR: python3.11 is not installed on this self-hosted agent."
+            echo "Install once on the VM, then re-run:"
+            echo "  sudo add-apt-repository ppa:deadsnakes/ppa -y"
+            echo "  sudo apt-get update && sudo apt-get install -y python3.11 python3.11-venv"
+            exit 1
+          fi
+          echo "Using Python: $PY"
+          "$PY" --version
+
+          # --- venv + deps ---
           "$PY" -m venv .venv
           . .venv/bin/activate
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-          # Ensure package-style imports work during tests/host
+          # Make package-style imports work during tests/host
           export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 
-          # Ensure local.settings.json & worker runtime exist
+          # --- Ensure local.settings.json exists (write via Python to avoid heredoc pitfalls) ---
           if [ ! -f local.settings.json ]; then
             if [ -f local.settings.example.json ]; then
               cp -f local.settings.example.json local.settings.json
             else
-              cat > local.settings.json <<'JSON'
-              {
-                "IsEncrypted": false,
-                "Values": {
-                  "AzureWebJobsStorage": "UseDevelopmentStorage=true",
-                  "FUNCTIONS_WORKER_RUNTIME": "python"
+              python - "$PWD/local.settings.json" <<'PY'
+                import json, sys, pathlib
+                out = pathlib.Path(sys.argv[1])
+                cfg = {
+                  "IsEncrypted": False,
+                  "Values": {
+                    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+                    "FUNCTIONS_WORKER_RUNTIME": "python"
+                  }
                 }
-              }
-              JSON
+                out.write_text(json.dumps(cfg, indent=2))
+                print(f"Wrote {out}")
+              PY
             fi
           fi
 
-          # Start Functions host and wait for readiness
+          # --- Start Functions host and wait for readiness ---
           LOG_FILE="$(Build.SourcesDirectory)/.func.log"
           PID_FILE="$(Build.SourcesDirectory)/.func.pid"
           nohup func start --python --port 7071 --verbose > "$LOG_FILE" 2>&1 & echo $! > "$PID_FILE"
@@ -271,7 +288,8 @@ stages:
 
           echo "Running pytest…"
           pytest -q
-        displayName: 'Create venv, start func, smoke-test, pytest'
+        displayName: 'Create venv (py3.11), start func, smoke-test, pytest'
+
 
       - bash: |
           set -euo pipefail
@@ -287,7 +305,7 @@ stages:
           tail -n 200 "$LOG_FILE" || true
         displayName: 'Stop func & show logs'
         condition: always()
-        
+
   # ---- build_dev ----
   - job: build_dev
     displayName: 'Build frontend for React with App Service & package function (dev)'

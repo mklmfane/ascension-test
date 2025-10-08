@@ -220,8 +220,8 @@ stages:
           cd "$(Build.SourcesDirectory)/api-function"
 
           # --- Force Python 3.11 (Functions v4 support) ---
-          if command -v python3.11 >/dev/null 2>&1; then
-            PY="$(command -v python3.11)"
+          if command -v python3 >/dev/null 2>&1; then
+            PY="$(command -v python3)"
           else
             echo "ERROR: python3.11 is not installed on this self-hosted agent."
             echo "Install once on the VM, then re-run:"

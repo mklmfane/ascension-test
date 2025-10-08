@@ -22,3 +22,7 @@ output "key_vault_name" {
 output "web_default_hostname" {
   value = azurerm_linux_web_app.react_web.default_hostname
 }
+
+output "react_web_name"  { 
+  value = azurerm_linux_web_app.react_web.name 
+}

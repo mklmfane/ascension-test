@@ -12,8 +12,7 @@ module "app_service" {
   resource_group_location    = local.rg_location
   resource_group_name        = local.rg_name
 
-  vnet_virtual_network_name  = azurerm_virtual_network.vnet.name
-  #vnet_address_space         = local.vnet_address_space        
+  vnet_virtual_network_name  = azurerm_virtual_network.vnet.name       
   subnet_integration_cidr    = local.subnet_integ_cidr
 
   web_plan_sku               = var.web_plan_sku            

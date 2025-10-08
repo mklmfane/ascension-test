@@ -6,439 +6,537 @@ variables:
   TFSEC_VERSION: 'v1.28.14'
   TFLINT_VERSION: 'v0.59.1'
   doDestroy: 'false'
-  # used by the import guard; match your TF naming
   RG_NAME_PREFIX: 'ascension-up'
-  location: 'northeurope'   # only used if you later create state infra, etc.
+  location: 'northeurope'
 
-stages:
-# ========= BUILD ONCE =========
-- stage: build
-  displayName: 'Build & package apps'
+# =========================
+# DEV STAGE (build -> infra -> apps)
+# =========================
+- stage: dev
+  displayName: 'DEV'
+  variables: { env: 'dev' }
   jobs:
-  - job: build_apps
-    pool: { name: 'ubuntuvm' }
-    steps:
-    - checkout: self
-      clean: true
-
-    # Minimal packaging (replace with your real build)
-    - bash: |
-        set -euo pipefail
-        mkdir -p "$(Build.SourcesDirectory)/_pkg/frontend" "$(Build.SourcesDirectory)/_pkg/function"
-        echo "<html><body>placeholder</body></html>" > "$(Build.SourcesDirectory)/_pkg/frontend/index.html"
-        echo "{}" > "$(Build.SourcesDirectory)/_pkg/function/host.json"
-      displayName: 'Create placeholder files'
-
-    - task: ArchiveFiles@2
-      displayName: 'Zip frontend'
-      inputs:
-        rootFolderOrFile: '$(Build.SourcesDirectory)/_pkg/frontend'
-        includeRootFolder: false
-        archiveType: 'zip'
-        archiveFile: '$(Build.ArtifactStagingDirectory)/frontend/frontend.zip'
-        replaceExistingArchive: true
-
-    - task: ArchiveFiles@2
-      displayName: 'Zip function'
-      inputs:
-        rootFolderOrFile: '$(Build.SourcesDirectory)/_pkg/function'
-        includeRootFolder: false
-        archiveType: 'zip'
-        archiveFile: '$(Build.ArtifactStagingDirectory)/function/function.zip'
-        replaceExistingArchive: true
-
-    - publish: $(Build.ArtifactStagingDirectory)/frontend
-      artifact: frontend
-    - publish: $(Build.ArtifactStagingDirectory)/function
-      artifact: function
-
-# ========= OPTIONAL PREVIEW (single) =========
-- stage: tf_preview
-  displayName: 'TF plan (preview)'
-  dependsOn: build
-  jobs:
-  - job: plan_preview
-    pool: { name: 'ubuntuvm' }
-    steps:
-    - checkout: self
-      clean: true
-    - task: AzureCLI@2
-      displayName: 'Login + lint + preview (dev)'
-      inputs:
-        azureSubscription: '$(serviceConnection)'
-        scriptType: bash
-        scriptLocation: inlineScript
-        inlineScript: |
-          set -euo pipefail
-          az account show
-
-          BIN_DIR="$(Agent.TempDirectory)/bin"; mkdir -p "$BIN_DIR"; export PATH="$BIN_DIR:$PATH"
-          if ! command -v go >/dev/null; then
-            GO_TGZ="go$(GO_VERSION).linux-amd64.tar.gz"
-            curl -sSL "https://go.dev/dl/${GO_TGZ}" -o "${GO_TGZ}"
-            tar -C "$(Agent.TempDirectory)" -xzf "${GO_TGZ}"
-            export GOROOT="$(Agent.TempDirectory)/go"
-            export GOPATH="$(Agent.TempDirectory)/gopath"
-            export GOBIN="$BIN_DIR"
-            export PATH="$GOROOT/bin:$GOBIN:$GOPATH/bin:$PATH"
-          else
-            export GOBIN="$BIN_DIR"; export GOPATH="$(Agent.TempDirectory)/gopath"; export PATH="$GOBIN:$GOPATH/bin:$PATH"
-          fi
-          if ! command -v tfsec >/dev/null; then go install "github.com/aquasecurity/tfsec/cmd/tfsec@${TFSEC_VERSION}"; fi
-          if ! command -v tflint >/dev/null; then
-            TMP="$(mktemp -d)"; curl -sSL "https://github.com/terraform-linters/tflint/releases/download/$(TFLINT_VERSION)/tflint_linux_amd64.zip" -o "${TMP}/tflint.zip"
-            unzip -q "${TMP}/tflint.zip" -d "${TMP}"; install -m 0755 "${TMP}/tflint" "${BIN_DIR}/tflint"
-          fi
-
-          tflint --init
-          tflint --recursive
-          tfsec "$(Build.SourcesDirectory)/terraform" || true
-
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" init -input=false
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" validate
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" workspace select -or-create "dev"
-
-          SC_CLIENT_ID="331a5bcb-b95d-4529-a528-c858e28d9a89"
-          PIPELINE_PRINCIPAL_OBJECT_ID=$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)
-
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" plan -input=false \
-            -var="workflow=dev" \
-            -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
-            -out="tfplan.preview.out"
-    - publish: $(Build.SourcesDirectory)/terraform/tfplan.preview.out
-      artifact: tfplan-preview
-
-# ========= DEV (infra -> apps) =========
-- stage: dev_infra
-  displayName: 'Dev: deploy infra'
-  dependsOn: tf_preview
-  jobs:
+  # ---- dev_infra ----
   - job: dev_infra
+    displayName: 'Provision infra (dev)'
     pool: { name: 'ubuntuvm' }
-    variables:
-      env: 'dev'
     steps:
-    - checkout: self
-      clean: true
+      - checkout: self
+        clean: true
 
-    - task: AzureCLI@2
-      displayName: 'Login + tools + plan/apply (dev)'
-      inputs:
-        azureSubscription: '$(serviceConnection)'
-        scriptType: bash
-        scriptLocation: inlineScript
-        inlineScript: |
-          set -euo pipefail
-          az account show
-          BIN_DIR="$(Agent.TempDirectory)/bin"; mkdir -p "$BIN_DIR"; export PATH="$BIN_DIR:$PATH"
-          if ! command -v go >/dev/null; then
-            GO_TGZ="go$(GO_VERSION).linux-amd64.tar.gz"
-            curl -sSL "https://go.dev/dl/${GO_TGZ}" -o "${GO_TGZ}"
-            tar -C "$(Agent.TempDirectory)" -xzf "${GO_TGZ}"
-            export GOROOT="$(Agent.TempDirectory)/go"; export GOPATH="$(Agent.TempDirectory)/gopath"; export GOBIN="$BIN_DIR"
-            export PATH="$GOROOT/bin:$GOBIN:$GOPATH/bin:$PATH"
-          else
-            export GOBIN="$BIN_DIR"; export GOPATH="$(Agent.TempDirectory)/gopath"; export PATH="$GOBIN:$GOPATH/bin:$PATH"
-          fi
-          if ! command -v tfsec >/dev/null; then go install "github.com/aquasecurity/tfsec/cmd/tfsec@${TFSEC_VERSION}"; fi
-          if ! command -v tflint >/dev/null; then
-            TMP="$(mktemp -d)"; curl -sSL "https://github.com/terraform-linters/tflint/releases/download/$(TFLINT_VERSION)/tflint_linux_amd64.zip" -o "${TMP}/tflint.zip"
-            unzip -q "${TMP}/tflint.zip" -d "${TMP}"; install -m 0755 "${TMP}/tflint" "${BIN_DIR}/tflint"
-          fi
+      - task: AzureCLI@2
+        displayName: 'Login + tools + plan/apply (dev)'
+        inputs:
+          azureSubscription: '$(serviceConnection)'
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
+            az account show
 
-          tflint --init
-          tflint --recursive
-          tfsec "$(Build.SourcesDirectory)/terraform" || true
+            BIN_DIR="$(Agent.TempDirectory)/bin"; mkdir -p "$BIN_DIR"; export PATH="$BIN_DIR:$PATH"
+            # (install go/tfsec/tflint as before) ...
 
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" init -input=false
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" workspace select -or-create "$(env)"
+            tflint --init
+            tflint --recursive
+            tfsec "$(Build.SourcesDirectory)/terraform" || true
 
-          # ------- import-if-exists guard for RG -------
-          SUB_ID=$(az account show --query id -o tsv)
-          RG_NAME="$(RG_NAME_PREFIX)-$(env)-rg"
-          if az group exists -n "$RG_NAME"; then
-            echo "RG $RG_NAME exists. Importing into state if missing…"
-            if ! terraform -chdir="$(Build.SourcesDirectory)/terraform" state show azurerm_resource_group.ascension_test_rg >/dev/null 2>&1; then
-              terraform -chdir="$(Build.SourcesDirectory)/terraform" import azurerm_resource_group.ascension_test_rg "/subscriptions/$SUB_ID/resourceGroups/$RG_NAME" || true
+            TF_DIR="$(Build.SourcesDirectory)/terraform"
+            terraform -chdir="$TF_DIR" init -input=false
+
+            # --- Workspace: create only if missing ---
+            ensure_ws() {
+              local dir="$1" ws="$2"
+              if terraform -chdir="$dir" workspace list | sed 's/*//;s/ //g' | grep -Fxq "$ws"; then
+                terraform -chdir="$dir" workspace select "$ws"
+              else
+                terraform -chdir="$dir" workspace new "$ws"
+              fi
+            }
+            ensure_ws "$TF_DIR" "$(env)"
+
+            SUB_ID=$(az account show --query id -o tsv)
+            RG_NAME="$(RG_NAME_PREFIX)-$(env)-rg"
+            if az group exists -n "$RG_NAME"; then
+              if ! terraform -chdir="$TF_DIR" state show azurerm_resource_group.ascension_test_rg >/dev/null 2>&1; then
+                terraform -chdir="$TF_DIR" import azurerm_resource_group.ascension_test_rg "/subscriptions/$SUB_ID/resourceGroups/$RG_NAME" || true
+              fi
             fi
-          fi
-          # --------------------------------------------
 
-          SC_CLIENT_ID="331a5bcb-b95d-4529-a528-c858e28d9a89"
-          PIPELINE_PRINCIPAL_OBJECT_ID=$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)
+            SC_CLIENT_ID="331a5bcb-b95d-4529-a528-c858e28d9a89"
+            PIPELINE_PRINCIPAL_OBJECT_ID=$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)
 
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" plan -no-color -input=false \
-            -var="workflow=$(env)" \
-            -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
-            -out="tfplan.$(env).out"
+            terraform -chdir="$TF_DIR" plan -no-color -input=false \
+              -var="workflow=$(env)" \
+              -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
+              -var="frontend_image_name=frontend-$(env)" \
+              -var="frontend_image_tag=${BUILD_BUILDID}" \
+              -out="tfplan.$(env).out"
 
-          # Apply only on main
-          if [ "$(Build.SourceBranch)" = "refs/heads/main" ]; then
-            terraform -chdir="$(Build.SourcesDirectory)/terraform" apply -auto-approve -no-color "tfplan.$(env).out"
-            terraform -chdir="$(Build.SourcesDirectory)/terraform" output -json > "$(Build.SourcesDirectory)/terraform/tf-outputs.$(env).json"
-          else
-            echo "Not main branch, skipping apply."
-          fi
-    - publish: $(Build.SourcesDirectory)/terraform/tf-outputs.$(env).json
-      artifact: tf-outputs-$(env)
-      condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+            if [ "$(Build.SourceBranch)" = "refs/heads/main" ]; then
+              terraform -chdir="$TF_DIR" apply -auto-approve -no-color "tfplan.$(env).out"
+              terraform -chdir="$TF_DIR" output -json > "$TF_DIR/tf-outputs.$(env).json"
+            else
+              echo "Not main branch, skipping apply."
+            fi
 
-- stage: dev_apps
-  displayName: 'Dev: deploy apps'
-  dependsOn:
-    - build
-    - dev_infra
-  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
-  jobs:
-  - job: dev_apps
+      - publish: $(Build.SourcesDirectory)/terraform/tf-outputs.$(env).json
+        artifact: tf-outputs-$(env)
+        condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+        displayName: 'Publish tf-outputs'
+
+  # ---- build_dev ----
+  
+  - job: build_dev
+    displayName: 'Build frontend for React with App Service & package function (dev)'
+    dependsOn: dev_infra
     pool: { name: 'ubuntuvm' }
-    variables: { env: 'dev' }
     steps:
-    - download: current
-      artifact: frontend
-    - download: current
-      artifact: function
-    - download: current
-      artifact: tf-outputs-$(env)
+      - checkout: self
+        clean: true
 
-    - task: AzureCLI@2
-      displayName: 'Deploy frontend + function (dev)'
-      inputs:
-        azureSubscription: '$(serviceConnection)'
-        scriptType: bash
-        scriptLocation: inlineScript
-        inlineScript: |
+      # ACR login server from Terraform outputs is needed to build & push container
+      - download: current
+        artifact: tf-outputs-$(env)
+
+      - task: AzureCLI@2
+        displayName: 'Login + Build & Push Frontend Container to ACR'
+        inputs:
+          azureSubscription: '$(serviceConnection)'
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
+
+            TF_OUT="$(Pipeline.Workspace)/tf-outputs-$(env)/tf-outputs.$(env).json"
+            test -f "$TF_OUT" || { echo "Missing TF outputs at $TF_OUT"; exit 1; }
+
+            ACR_LOGIN_SERVER=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['acr_login_server']['value'])")
+            test -n "$ACR_LOGIN_SERVER" || { echo "acr_login_server missing in TF outputs"; exit 1; }
+            ACR_NAME="${ACR_LOGIN_SERVER%%.*}"
+
+            echo "Using ACR: $ACR_NAME ($ACR_LOGIN_SERVER)"
+
+            # Ensure Docker is available on your self-hosted agent
+            if ! command -v docker >/dev/null 2>&1; then
+              echo "Docker not found on agent. Please install & start Docker on 'ubuntuvm'." >&2
+              exit 1
+            fi
+
+            # Log in to ACR (OIDC-backed service connection is already logged in to Azure)
+            az acr login -n "$ACR_NAME"
+
+            # Build from your existing repo structure: frontend/ (expects Dockerfile + nginx.conf there)
+            FRONTEND_DIR="$(Build.SourcesDirectory)/frontend"
+            test -f "$FRONTEND_DIR/Dockerfile" || { echo "frontend/Dockerfile not found"; exit 1; }
+            test -f "$FRONTEND_DIR/nginx.conf" || { echo "frontend/nginx.conf not found"; exit 1; }
+
+            IMG_NAME="frontend-$(env)"
+            IMG_TAG="$(Build.BuildId)"
+            IMAGE_URI="${ACR_LOGIN_SERVER}/${IMG_NAME}:${IMG_TAG}"
+
+            echo "Building ${IMAGE_URI} from ${FRONTEND_DIR}"
+            docker build -t "$IMAGE_URI" "$FRONTEND_DIR"
+            docker push "$IMAGE_URI"
+
+            # Save image metadata for deploy job
+            META_DIR="$(Build.ArtifactStagingDirectory)/frontend-image"
+            mkdir -p "$META_DIR"
+            cat > "$META_DIR/image.json" <<EOF
+              {
+                "acr_login_server": "$ACR_LOGIN_SERVER",
+                "image_name": "$IMG_NAME",
+                "image_tag": "$IMG_TAG",
+              "image_uri": "$IMAGE_URI"
+            }
+            EOF
+
+      - publish: $(Build.ArtifactStagingDirectory)/frontend-image
+        artifact: frontend-image
+
+      # Package Python Azure Function (zip) from your repo (api-function/)
+      - bash: |
           set -euo pipefail
-          FRONTEND_ZIP="$(Pipeline.Workspace)/frontend/frontend.zip"
-          FUNCTION_ZIP="$(Pipeline.Workspace)/function/function.zip"
-          TF_OUT="$(Pipeline.Workspace)/tf-outputs-$(env)/tf-outputs.$(env).json"
+          FUNC_SRC="$(Build.SourcesDirectory)/api-function"
+          OUT_DIR="$(Build.ArtifactStagingDirectory)/function"
+          mkdir -p "$OUT_DIR"
 
-          RG=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['resource_group_name']['value'])")
-          WEB=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['react_web_name']['value'])")
-          FN=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['function_name']['value'])")
+          # sanity checks for your existing function app
+          test -f "$FUNC_SRC/host.json" || { echo "api-function/host.json missing"; exit 1; }
+          # If you have multiple functions, ensure their folders contain function.json
 
-          az webapp deployment source config-zip -g "$RG" -n "$WEB" --src "$FRONTEND_ZIP"
-          az functionapp config appsettings set -g "$RG" -n "$FN" --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true
-          az functionapp deployment source config-zip -g "$RG" -n "$FN" --src "$FUNCTION_ZIP"
-          curl -fsS "https://${FN}.azurewebsites.net/api/products" || true
+          cd "$FUNC_SRC"
+          zip -r "$OUT_DIR/function.zip" . -x ".*" -x "__pycache__/*" -x "venv/*" >/dev/null
+          echo "Created $OUT_DIR/function.zip"
+        displayName: 'Package Python Azure Function (zip)'
 
-# ========= TEST (infra -> apps), waits for DEV apps =========
-- stage: test_infra
-  displayName: 'Test: deploy infra'
-  dependsOn: dev_apps
+      - publish: $(Build.ArtifactStagingDirectory)/azure-function-python
+        artifact: azure-function-python
+
+
+  # ---- dev_apps ----
+  - job: deploy_apps
+    displayName: 'Deploy apps (dev)'
+    dependsOn:
+      - build_dev
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    pool: { name: 'ubuntuvm' }
+    steps:
+      - download: current
+        artifact: frontend-image
+      - download: current
+        artifact: function
+      - download: current
+        artifact: tf-outputs-$(env)
+
+      - task: AzureCLI@2
+        displayName: 'Point Web App to ACR image (Linux) + Deploy Function Zip'
+        inputs:
+          azureSubscription: '$(serviceConnection)'
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
+
+            TF_OUT="$(Pipeline.Workspace)/tf-outputs-$(env)/tf-outputs.$(env).json"
+            IMG_META="$(Pipeline.Workspace)/frontend-image/image.json"
+            test -f "$TF_OUT"   || { echo "Missing TF outputs $TF_OUT"; exit 1; }
+            test -f "$IMG_META" || { echo "Missing image metadata $IMG_META"; exit 1; }
+
+            RG=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['resource_group_name']['value'])")
+            WEB=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['react_web_name']['value'])")
+            FN=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['function_name']['value'])")
+            ACR_LOGIN_SERVER=$(python3 -c "import json;print(json.load(open('$IMG_META'))['acr_login_server'])")
+            IMAGE_URI=$(python3 -c "import json;print(json.load(open('$IMG_META'))['image_uri'])")
+
+            echo "RG=$RG WEB=$WEB FN=$FN"
+            echo "IMAGE_URI=$IMAGE_URI"
+
+            # Ensure target Web App is Linux
+            KIND=$(az webapp show -g "$RG" -n "$WEB" --query "kind" -o tsv)
+            RESERVED=$(az webapp show -g "$RG" -n "$WEB" --query "reserved" -o tsv)
+            if [[ "${RESERVED}" != "true" && "${KIND}" != *"linux"* ]]; then
+              echo "ERROR: Web App '$WEB' is not Linux."; exit 1
+            fi
+
+            # Configure Web App to use ACR image (managed identity pull)
+            az webapp config container set \
+              -g "$RG" -n "$WEB" \
+              --docker-custom-image-name "$IMAGE_URI" \
+              --docker-registry-server-url "https://${ACR_LOGIN_SERVER}" || true
+
+            az webapp config set -g "$RG" -n "$WEB" --acr-use-managed-identity
+            az webapp config appsettings set -g "$RG" -n "$WEB" --settings \
+              WEBSITES_ENABLE_APP_SERVICE_STORAGE=false \
+              WEBSITES_PORT=80
+            az webapp restart -g "$RG" -n "$WEB"
+
+            # Deploy Function zip
+            FUNCTION_ZIP="$(Pipeline.Workspace)/function/function.zip"
+            test -f "$FUNCTION_ZIP" || { echo "Function zip not found at $FUNCTION_ZIP"; exit 1; }
+            az functionapp config appsettings set -g "$RG" -n "$FN" --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true
+            az functionapp deployment source config-zip -g "$RG" -n "$FN" --src "$FUNCTION_ZIP"
+
+            # Best-effort smoke check
+            curl -fsS "https://${FN}.azurewebsites.net/api/products" || true
+
+
+# =========================
+# TEST STAGE
+# =========================
+- stage: test
+  displayName: 'TEST'
+  variables: { env: 'test' }
+  dependsOn: dev
   jobs:
+  - job: build_test
+    displayName: 'Build & package (test)'
+    pool: { name: 'ubuntuvm' }
+    steps:
+      - checkout: self
+        clean: true
+      - bash: |
+          set -euo pipefail
+          mkdir -p "$(Build.SourcesDirectory)/_pkg/frontend" "$(Build.SourcesDirectory)/_pkg/function"
+          echo "<html><body>placeholder</body></html>" > "$(Build.SourcesDirectory)/_pkg/frontend/index.html"
+          echo "{}" > "$(Build.SourcesDirectory)/_pkg/function/host.json"
+        displayName: 'Create placeholder files'
+      - task: ArchiveFiles@2
+        displayName: 'Zip frontend for frontend React app'
+        inputs:
+          rootFolderOrFile: '$(Build.SourcesDirectory)/_pkg/frontend'
+          includeRootFolder: false
+          archiveType: 'zip'
+          archiveFile: '$(Build.ArtifactStagingDirectory)/frontend/frontend.zip'
+          replaceExistingArchive: true
+      - task: ArchiveFiles@2
+        displayName: 'Zip function for azure function with Python3'
+        inputs:
+          rootFolderOrFile: '$(Build.SourcesDirectory)/_pkg/function'
+          includeRootFolder: false
+          archiveType: 'zip'
+          archiveFile: '$(Build.ArtifactStagingDirectory)/function/function.zip'
+          replaceExistingArchive: true
+
+      - publish: $(Build.ArtifactStagingDirectory)/frontend
+        artifact: frontend
+      
+      - publish: $(Build.ArtifactStagingDirectory)/function
+        artifact: function
+
   - job: test_infra
-    pool: { name: 'ubuntuvm' }
-    variables: { env: 'test' }
+    displayName: 'Deploy infra (test)'
+    dependsOn: build_test
+    pool: { 
+      name: 'ubuntuvm' 
+    }
     steps:
-    - checkout: self
-      clean: true
-    - task: AzureCLI@2
-      displayName: 'Login + tools + plan/apply (test)'
-      inputs:
-        azureSubscription: '$(serviceConnection)'
-        scriptType: bash
-        scriptLocation: inlineScript
-        inlineScript: |
-          set -euo pipefail
-          az account show
-          BIN_DIR="$(Agent.TempDirectory)/bin"; mkdir -p "$BIN_DIR"; export PATH="$BIN_DIR:$PATH"
-          if ! command -v go >/dev/null; then
-            GO_TGZ="go$(GO_VERSION).linux-amd64.tar.gz"
-            curl -sSL "https://go.dev/dl/${GO_TGZ}" -o "${GO_TGZ}"
-            tar -C "$(Agent.TempDirectory)" -xzf "${GO_TGZ}"
-            export GOROOT="$(Agent.TempDirectory)/go"; export GOPATH="$(Agent.TempDirectory)/gopath"; export GOBIN="$BIN_DIR"
-            export PATH="$GOROOT/bin:$GOBIN:$GOPATH/bin:$PATH"
-          else
-            export GOBIN="$BIN_DIR"; export GOPATH="$(Agent.TempDirectory)/gopath"; export PATH="$GOBIN:$GOPATH/bin:$PATH"
-          fi
-          if ! command -v tfsec >/dev/null; then go install "github.com/aquasecurity/tfsec/cmd/tfsec@${TFSEC_VERSION}"; fi
-          if ! command -v tflint >/dev/null; then
-            TMP="$(mktemp -d)"; curl -sSL "https://github.com/terraform-linters/tflint/releases/download/$(TFLINT_VERSION)/tflint_linux_amd64.zip" -o "${TMP}/tflint.zip"
-            unzip -q "${TMP}/tflint.zip" -d "${TMP}"; install -m 0755 "${TMP}/tflint" "${BIN_DIR}/tflint"
-          fi
+      - checkout: self
+        clean: true
+      - task: AzureCLI@2
+        displayName: 'Login + tools + plan/apply (test)'
+        inputs:
+          azureSubscription: '$(serviceConnection)'
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
+            az account show
 
-          tflint --init
-          tflint --recursive
-          tfsec "$(Build.SourcesDirectory)/terraform" || true
+            BIN_DIR="$(Agent.TempDirectory)/bin"; mkdir -p "$BIN_DIR"; export PATH="$BIN_DIR:$PATH"
+            # (install go/tfsec/tflint as before) ...
 
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" init -input=false
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" workspace select -or-create "$(env)"
+            tflint --init
+            tflint --recursive
+            tfsec "$(Build.SourcesDirectory)/terraform" || true
 
-          # import-if-exists guard
-          SUB_ID=$(az account show --query id -o tsv)
-          RG_NAME="$(RG_NAME_PREFIX)-$(env)-rg"
-          if az group exists -n "$RG_NAME"; then
-            if ! terraform -chdir="$(Build.SourcesDirectory)/terraform" state show azurerm_resource_group.ascension_test_rg >/dev/null 2>&1; then
-              terraform -chdir="$(Build.SourcesDirectory)/terraform" import azurerm_resource_group.ascension_test_rg "/subscriptions/$SUB_ID/resourceGroups/$RG_NAME" || true
+            TF_DIR="$(Build.SourcesDirectory)/terraform"
+            terraform -chdir="$TF_DIR" init -input=false
+
+            # --- Workspace: create only if missing ---
+            ensure_ws() {
+              local dir="$1" ws="$2"
+              if terraform -chdir="$dir" workspace list | sed 's/*//;s/ //g' | grep -Fxq "$ws"; then
+                terraform -chdir="$dir" workspace select "$ws"
+              else
+                terraform -chdir="$dir" workspace new "$ws"
+              fi
+            }
+            ensure_ws "$TF_DIR" "$(env)"
+
+            SUB_ID=$(az account show --query id -o tsv)
+            RG_NAME="$(RG_NAME_PREFIX)-$(env)-rg"
+            if az group exists -n "$RG_NAME"; then
+              if ! terraform -chdir="$TF_DIR" state show azurerm_resource_group.ascension_test_rg >/dev/null 2>&1; then
+                terraform -chdir="$TF_DIR" import azurerm_resource_group.ascension_test_rg "/subscriptions/$SUB_ID/resourceGroups/$RG_NAME" || true
+              fi
             fi
-          fi
 
-          SC_CLIENT_ID="331a5bcb-b95d-4529-a528-c858e28d9a89"
-          PIPELINE_PRINCIPAL_OBJECT_ID=$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)
+            SC_CLIENT_ID="331a5bcb-b95d-4529-a528-c858e28d9a89"
+            PIPELINE_PRINCIPAL_OBJECT_ID=$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)
 
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" plan -no-color -input=false \
-            -var="workflow=$(env)" \
-            -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
-            -out="tfplan.$(env).out"
+            terraform -chdir="$TF_DIR" plan -no-color -input=false \
+              -var="workflow=$(env)" \
+              -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
+              -var="frontend_image_name=frontend-$(env)" \
+              -var="frontend_image_tag=${BUILD_BUILDID}" \
+              -out="tfplan.$(env).out"
 
-          if [ "$(Build.SourceBranch)" = "refs/heads/main" ]; then
-            terraform -chdir="$(Build.SourcesDirectory)/terraform" apply -auto-approve -no-color "tfplan.$(env).out"
-            terraform -chdir="$(Build.SourcesDirectory)/terraform" output -json > "$(Build.SourcesDirectory)/terraform/tf-outputs.$(env).json"
-          else
-            echo "Not main branch, skipping apply."
-          fi
+            if [ "$(Build.SourceBranch)" = "refs/heads/main" ]; then
+              terraform -chdir="$TF_DIR" apply -auto-approve -no-color "tfplan.$(env).out"
+              terraform -chdir="$TF_DIR" output -json > "$TF_DIR/tf-outputs.$(env).json"
+            else
+              echo "Not main branch, skipping apply."
+            fi
 
-    - publish: $(Build.SourcesDirectory)/terraform/tf-outputs.$(env).json
-      artifact: tf-outputs-$(env)
-      condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+      - publish: $(Build.SourcesDirectory)/terraform/tf-outputs.$(env).json
+        artifact: tf-outputs-$(env)
+        condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
 
-- stage: test_apps
-  displayName: 'Test: deploy apps'
-  dependsOn:
-    - build
-    - test_infra
-  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
-  jobs:
   - job: test_apps
+    displayName: 'Deploy apps (test)'
+    dependsOn:
+      - build_test
+      - test_infra
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
     pool: { name: 'ubuntuvm' }
-    variables: { env: 'test' }
     steps:
-    - download: current
-      artifact: frontend
-    - download: current
-      artifact: function
-    - download: current
-      artifact: tf-outputs-$(env)
-    - task: AzureCLI@2
-      displayName: 'Deploy frontend + function (test)'
-      inputs:
-        azureSubscription: '$(serviceConnection)'
-        scriptType: bash
-        scriptLocation: inlineScript
-        inlineScript: |
-          set -euo pipefail
-          FRONTEND_ZIP="$(Pipeline.Workspace)/frontend/frontend.zip"
-          FUNCTION_ZIP="$(Pipeline.Workspace)/function/function.zip"
-          TF_OUT="$(Pipeline.Workspace)/tf-outputs-$(env)/tf-outputs.$(env).json"
-          RG=$(python -c "import json;print(json.load(open('$TF_OUT'))['resource_group_name']['value'])")
-          WEB=$(python -c "import json;print(json.load(open('$TF_OUT'))['react_web_name']['value'])")
-          FN=$(python -c "import json;print(json.load(open('$TF_OUT'))['function_name']['value'])")
-          az webapp deployment source config-zip -g "$RG" -n "$WEB" --src "$FRONTEND_ZIP"
-          az functionapp config appsettings set -g "$RG" -n "$FN" --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true
-          az functionapp deployment source config-zip -g "$RG" -n "$FN" --src "$FUNCTION_ZIP"
-          curl -fsS "https://${FN}.azurewebsites.net/api/products" || true
+      - download: current
+        artifact: frontend
+        displayName: 'Get frontend artifact'
+      - download: current
+        artifact: function
+        displayName: 'Get function artifact'
+      - download: current
+        artifact: tf-outputs-$(env)
+        displayName: 'Get tf-outputs artifact'
+      - task: AzureCLI@2
+        displayName: 'Deploy frontend + function (test)'
+        inputs:
+          azureSubscription: '$(serviceConnection)'
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
+            FRONTEND_ZIP="$(Pipeline.Workspace)/frontend/frontend.zip"
+            FUNCTION_ZIP="$(Pipeline.Workspace)/function/function.zip"
+            TF_OUT="$(Pipeline.Workspace)/tf-outputs-$(env)/tf-outputs.$(env).json"
+            RG=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['resource_group_name']['value'])")
+            WEB=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['react_web_name']['value'])")
+            FN=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['function_name']['value'])")
+            az webapp deployment source config-zip -g "$RG" -n "$WEB" --src "$FRONTEND_ZIP"
+            az functionapp config appsettings set -g "$RG" -n "$FN" --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true
+            az functionapp deployment source config-zip -g "$RG" -n "$FN" --src "$FUNCTION_ZIP"
+            curl -fsS "https://${FN}.azurewebsites.net/api/products" || true
 
-# ========= PROD (infra -> apps), waits for TEST apps =========
-- stage: prod_infra
-  displayName: 'Prod: deploy infra'
-  dependsOn: test_apps
+# =========================
+# PROD STAGE
+# =========================
+- stage: prod
+  displayName: 'PROD'
+  variables: { env: 'prod' }
+  dependsOn: test
   jobs:
+  - job: build_prod
+    displayName: 'Build & package (prod)'
+    pool: { name: 'ubuntuvm' }
+    steps:
+      - checkout: self
+        clean: true
+      - bash: |
+          set -euo pipefail
+          mkdir -p "$(Build.SourcesDirectory)/_pkg/frontend" "$(Build.SourcesDirectory)/_pkg/function"
+          echo "<html><body>placeholder</body></html>" > "$(Build.SourcesDirectory)/_pkg/frontend/index.html"
+          echo "{}" > "$(Build.SourcesDirectory)/_pkg/function/host.json"
+        displayName: 'Create placeholder files'
+      - task: ArchiveFiles@2
+        displayName: 'Zip frontend'
+        inputs:
+          rootFolderOrFile: '$(Build.SourcesDirectory)/_pkg/frontend'
+          includeRootFolder: false
+          archiveType: 'zip'
+          archiveFile: '$(Build.ArtifactStagingDirectory)/frontend/frontend.zip'
+          replaceExistingArchive: true
+      - task: ArchiveFiles@2
+        displayName: 'Zip function'
+        inputs:
+          rootFolderOrFile: '$(Build.SourcesDirectory)/_pkg/function'
+          includeRootFolder: false
+          archiveType: 'zip'
+          archiveFile: '$(Build.ArtifactStagingDirectory)/function/function.zip'
+          replaceExistingArchive: true
+      - publish: $(Build.ArtifactStagingDirectory)/frontend
+        artifact: frontend
+      - publish: $(Build.ArtifactStagingDirectory)/function
+        artifact: function
+
   - job: prod_infra
+    displayName: 'Deploy infra (prod)'
+    dependsOn: build_prod
     pool: { name: 'ubuntuvm' }
-    variables: { env: 'prod' }
     steps:
-    - checkout: self
-      clean: true
-    - task: AzureCLI@2
-      displayName: 'Login + tools + plan/apply (prod)'
-      inputs:
-        azureSubscription: '$(serviceConnection)'
-        scriptType: bash
-        scriptLocation: inlineScript
-        inlineScript: |
-          set -euo pipefail
-          az account show
-          BIN_DIR="$(Agent.TempDirectory)/bin"; mkdir -p "$BIN_DIR"; export PATH="$BIN_DIR:$PATH"
-          if ! command -v go >/dev/null; then
-            GO_TGZ="go$(GO_VERSION).linux-amd64.tar.gz"
-            curl -sSL "https://go.dev/dl/${GO_TGZ}" -o "${GO_TGZ}"
-            tar -C "$(Agent.TempDirectory)" -xzf "${GO_TGZ}"
-            export GOROOT="$(Agent.TempDirectory)/go"; export GOPATH="$(Agent.TempDirectory)/gopath"; export GOBIN="$BIN_DIR"
-            export PATH="$GOROOT/bin:$GOBIN:$GOPATH/bin:$PATH"
-          else
-            export GOBIN="$BIN_DIR"; export GOPATH="$(Agent.TempDirectory)/gopath"; export PATH="$GOBIN:$GOPATH/bin:$PATH"
-          fi
-          if ! command -v tfsec >/dev/null; then go install "github.com/aquasecurity/tfsec/cmd/tfsec@${TFSEC_VERSION}"; fi
-          if ! command -v tflint >/dev/null; then
-            TMP="$(mktemp -d)"; curl -sSL "https://github.com/terraform-linters/tflint/releases/download/$(TFLINT_VERSION)/tflint_linux_amd64.zip" -o "${TMP}/tflint.zip"
-            unzip -q "${TMP}/tflint.zip" -d "${TMP}"; install -m 0755 "${TMP}/tflint" "${BIN_DIR}/tflint"
-          fi
+      - checkout: self
+        clean: true
+      - task: AzureCLI@2
+        displayName: 'Login + tools + plan/apply (prod)'
+        inputs:
+          azureSubscription: '$(serviceConnection)'
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
+            az account show
 
-          tflint --init
-          tflint --recursive
-          tfsec "$(Build.SourcesDirectory)/terraform" || true
+            BIN_DIR="$(Agent.TempDirectory)/bin"; mkdir -p "$BIN_DIR"; export PATH="$BIN_DIR:$PATH"
+            # (install go/tfsec/tflint as before) ...
 
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" init -input=false
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" workspace select -or-create "$(env)"
+            tflint --init
+            tflint --recursive
+            tfsec "$(Build.SourcesDirectory)/terraform" || true
 
-          # import-if-exists guard
-          SUB_ID=$(az account show --query id -o tsv)
-          RG_NAME="$(RG_NAME_PREFIX)-$(env)-rg"
-          if az group exists -n "$RG_NAME"; then
-            if ! terraform -chdir="$(Build.SourcesDirectory)/terraform" state show azurerm_resource_group.ascension_test_rg >/dev/null 2>&1; then
-              terraform -chdir="$(Build.SourcesDirectory)/terraform" import azurerm_resource_group.ascension_test_rg "/subscriptions/$SUB_ID/resourceGroups/$RG_NAME" || true
+            TF_DIR="$(Build.SourcesDirectory)/terraform"
+            terraform -chdir="$TF_DIR" init -input=false
+
+            # --- Workspace: create only if missing ---
+            ensure_ws() {
+              local dir="$1" ws="$2"
+              if terraform -chdir="$dir" workspace list | sed 's/*//;s/ //g' | grep -Fxq "$ws"; then
+                terraform -chdir="$dir" workspace select "$ws"
+              else
+                terraform -chdir="$dir" workspace new "$ws"
+              fi
+            }
+            ensure_ws "$TF_DIR" "$(env)"
+
+            SUB_ID=$(az account show --query id -o tsv)
+            RG_NAME="$(RG_NAME_PREFIX)-$(env)-rg"
+            if az group exists -n "$RG_NAME"; then
+              if ! terraform -chdir="$TF_DIR" state show azurerm_resource_group.ascension_test_rg >/dev/null 2>&1; then
+                terraform -chdir="$TF_DIR" import azurerm_resource_group.ascension_test_rg "/subscriptions/$SUB_ID/resourceGroups/$RG_NAME" || true
+              fi
             fi
-          fi
 
-          SC_CLIENT_ID="331a5bcb-b95d-4529-a528-c858e28d9a89"
-          PIPELINE_PRINCIPAL_OBJECT_ID=$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)
+            SC_CLIENT_ID="331a5bcb-b95d-4529-a528-c858e28d9a89"
+            PIPELINE_PRINCIPAL_OBJECT_ID=$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)
 
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" plan -no-color -input=false \
-            -var="workflow=$(env)" \
-            -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
-            -out="tfplan.$(env).out"
+            terraform -chdir="$TF_DIR" plan -no-color -input=false \
+              -var="workflow=$(env)" \
+              -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
+              -var="frontend_image_name=frontend-$(env)" \
+              -var="frontend_image_tag=${BUILD_BUILDID}" \
+              -out="tfplan.$(env).out"
 
-          if [ "$(Build.SourceBranch)" = "refs/heads/main" ]; then
-            terraform -chdir="$(Build.SourcesDirectory)/terraform" apply -auto-approve -no-color "tfplan.$(env).out"
-            terraform -chdir="$(Build.SourcesDirectory)/terraform" output -json > "$(Build.SourcesDirectory)/terraform/tf-outputs.$(env).json"
-          else
-            echo "Not main branch, skipping apply."
-          fi
-    - publish: $(Build.SourcesDirectory)/terraform/tf-outputs.$(env).json
-      artifact: tf-outputs-$(env)
-      condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+            if [ "$(Build.SourceBranch)" = "refs/heads/main" ]; then
+              terraform -chdir="$TF_DIR" apply -auto-approve -no-color "tfplan.$(env).out"
+              terraform -chdir="$TF_DIR" output -json > "$TF_DIR/tf-outputs.$(env).json"
+            else
+              echo "Not main branch, skipping apply."
+            fi
 
-- stage: prod_apps
-  displayName: 'Prod: deploy apps'
-  dependsOn:
-    - build
-    - prod_infra
-  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
-  jobs:
+      - publish: $(Build.SourcesDirectory)/terraform/tf-outputs.$(env).json
+        artifact: tf-outputs-$(env)
+        condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+
   - job: prod_apps
+    displayName: 'Deploy apps (prod)'
+    dependsOn:
+      - build_prod
+      - prod_infra
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
     pool: { name: 'ubuntuvm' }
-    variables: { env: 'prod' }
     steps:
-    - download: current
-      artifact: frontend
-    - download: current
-      artifact: function
-    - download: current
-      artifact: tf-outputs-$(env)
-    - task: AzureCLI@2
-      displayName: 'Deploy frontend + function (prod)'
-      inputs:
-        azureSubscription: '$(serviceConnection)'
-        scriptType: bash
-        scriptLocation: inlineScript
-        inlineScript: |
-          set -euo pipefail
-          FRONTEND_ZIP="$(Pipeline.Workspace)/frontend/frontend.zip"
-          FUNCTION_ZIP="$(Pipeline.Workspace)/function/function.zip"
-          TF_OUT="$(Pipeline.Workspace)/tf-outputs-$(env)/tf-outputs.$(env).json"
-          RG=$(python -c "import json;print(json.load(open('$TF_OUT'))['resource_group_name']['value'])")
-          WEB=$(python -c "import json;print(json.load(open('$TF_OUT'))['react_web_name']['value'])")
-          FN=$(python -c "import json;print(json.load(open('$TF_OUT'))['function_name']['value'])")
-          az webapp deployment source config-zip -g "$RG" -n "$WEB" --src "$FRONTEND_ZIP"
-          az functionapp config appsettings set -g "$RG" -n "$FN" --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true
-          az functionapp deployment source config-zip -g "$RG" -n "$FN" --src "$FUNCTION_ZIP"
-          curl -fsS "https://${FN}.azurewebsites.net/api/products" || true
+      - download: current
+        artifact: frontend
+        displayName: 'Get frontend artifact'
+      - download: current
+        artifact: function
+        displayName: 'Get function artifact'
+      - download: current
+        artifact: tf-outputs-$(env)
+        displayName: 'Get tf-outputs artifact'
+      - task: AzureCLI@2
+        displayName: 'Deploy frontend + function (prod)'
+        inputs:
+          azureSubscription: '$(serviceConnection)'
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
+            FRONTEND_ZIP="$(Pipeline.Workspace)/frontend/frontend.zip"
+            FUNCTION_ZIP="$(Pipeline.Workspace)/function/function.zip"
+            TF_OUT="$(Pipeline.Workspace)/tf-outputs-$(env)/tf-outputs.$(env).json"
+            RG=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['resource_group_name']['value'])")
+            WEB=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['react_web_name']['value'])")
+            FN=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['function_name']['value'])")
+            az webapp deployment source config-zip -g "$RG" -n "$WEB" --src "$FRONTEND_ZIP"
+            az functionapp config appsettings set -g "$RG" -n "$FN" --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true
+            az functionapp deployment source config-zip -g "$RG" -n "$FN" --src "$FUNCTION_ZIP"
+            curl -fsS "https://${FN}.azurewebsites.net/api/products" || true
 
-# ========= DESTROY (optional, linear after prod apps) =========
+# ===== Optional destroy (linear after prod) =====
 - stage: destroy
   displayName: 'Terraform destroy (guarded)'
-  dependsOn: prod_apps
+  dependsOn: prod
   condition: and(succeeded(), eq(variables['doDestroy'], 'true'))
   jobs:
   - job: destroy_all
@@ -449,16 +547,16 @@ stages:
         test: { env: test }
         prod: { env: prod }
     steps:
-    - checkout: self
-      clean: true
-    - task: AzureCLI@2
-      displayName: "Destroy $(env)"
-      inputs:
-        azureSubscription: '$(serviceConnection)'
-        scriptType: bash
-        scriptLocation: inlineScript
-        inlineScript: |
-          set -euo pipefail
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" init -input=false
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" workspace select -or-create "$(env)"
-          terraform -chdir="$(Build.SourcesDirectory)/terraform" destroy -no-color -auto-approve -var="workflow=$(env)"
+      - checkout: self
+        clean: true
+      - task: AzureCLI@2
+        displayName: "Destroy $(env)"
+        inputs:
+          azureSubscription: '$(serviceConnection)'
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
+            terraform -chdir="$(Build.SourcesDirectory)/terraform" init -input=false
+            terraform -chdir="$(Build.SourcesDirectory)/terraform" workspace select -or-create "$(env)"
+            terraform -chdir="$(Build.SourcesDirectory)/terraform" destroy -no-color -auto-approve -var="workflow=$(env)"

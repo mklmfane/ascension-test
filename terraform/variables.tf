@@ -78,6 +78,16 @@ variable "pipeline_principal_id" {
   default     = "4caad26c-42ac-4643-867a-6fb323d62e4a"
 }
 
+# Optional knobs to pass from CI
+variable "frontend_image_name" {
+  type    = string
+  default = "frontend"
+}
+variable "frontend_image_tag" {
+  type    = string
+  default = "" # pipeline will pass a value
+}
+
 variable "tags" {
   description = "Additional resource tags"
   type        = map(string)

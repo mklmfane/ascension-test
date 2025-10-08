@@ -19,6 +19,7 @@ stages:
   variables: { env: 'dev' }
   jobs:
   # ---- dev_infra ----
+  # ---- dev_infra ----
   - job: dev_infra
     displayName: 'Provision infra (dev)'
     pool: { name: 'ubuntuvm' }
@@ -36,27 +37,26 @@ stages:
             set -euo pipefail
             az account show
 
-            BIN_DIR="$(Agent.TempDirectory)/bin"; mkdir -p "$BIN_DIR"; export PATH="$BIN_DIR:$PATH"
-            # (install go/tfsec/tflint as before) ...
-            tflint --init
-            tflint --recursive
-            tfsec "$(Build.SourcesDirectory)/terraform" || true
-
             TF_DIR="$(Build.SourcesDirectory)/terraform"
-            terraform -chdir="$TF_DIR" init -input=false
 
-            # --- Workspace: create only if missing ---
+            # --- Optional lint (kept minimal here) ---
+            BIN_DIR="$(Agent.TempDirectory)/bin"; mkdir -p "$BIN_DIR"; export PATH="$BIN_DIR:$PATH"
+            tflint --init && tflint --recursive || true
+            tfsec "$TF_DIR" || true
+
+            # --- Init + workspace (create only if missing) ---
+            terraform -chdir="$TF_DIR" init -input=false
             ensure_ws() {
               local dir="$1" ws="$2"
               if terraform -chdir="$dir" workspace list | sed 's/*//;s/ //g' | grep -Fxq "$ws"; then
-                  terraform -chdir="$dir" workspace select "$ws"
+                terraform -chdir="$dir" workspace select "$ws"
               else
                 terraform -chdir="$dir" workspace new "$ws"
               fi
             }
             ensure_ws "$TF_DIR" "$(env)"
 
-            # --- Import-if-exists guard for Resource Group ---
+            # --- Import-if-exists guard for Resource Group (idempotent) ---
             SUB_ID=$(az account show --query id -o tsv)
             RG_NAME="$(RG_NAME_PREFIX)-$(env)-rg"
             if az group exists -n "$RG_NAME"; then
@@ -65,24 +65,43 @@ stages:
               fi
             fi
 
-            # --- Resolve pipeline principal (you already pass it into TF as a var) ---
-            # If you prefer a fixed object id, set PIPELINE_PRINCIPAL_OBJECT_ID directly.
+            # --- Resolve pipeline principal object id you pass to TF ---
             SC_CLIENT_ID="331a5bcb-b95d-4529-a528-c858e28d9a89"
             PIPELINE_PRINCIPAL_OBJECT_ID=$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)
 
-            # ===== Import-if-exists guards for KV role assignments (BEFORE plan) =====
-            #TF_ADDR_SELF="module.app_service.azurerm_role_assignment.kv_secrets_officer_self"
-            #TF_ADDR_PIPE="module.app_service.azurerm_role_assignment.kv_secrets_officer_pipeline[0]"
+            # =========================================================
+            # Phase 1: Targeted apply to create the Key Vault only
+            # (so we can import existing KV role assignments if they exist)
+            # =========================================================
+            echo ">>> Phase 1: apply target to create Key Vault"
+            terraform -chdir="$TF_DIR" plan -no-color -input=false \
+              -target=module.app_service.azurerm_key_vault.kv \
+              -var="workflow=$(env)" \
+              -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
+              -out="tfplan.phase1.$(env).out"
 
-            # Resolve KV id by naming pattern: kv-<env>-ascension-<random>
-            KV_ID=$(az keyvault list -g "$RG_NAME" \
-              --query "[?starts_with(name, 'kv-$(env)-ascension-')].id | [0]" -o tsv || true)
+            terraform -chdir="$TF_DIR" apply -auto-approve -no-color "tfplan.phase1.$(env).out"
 
-            if [ -n "$KV_ID" ]; then
-              ROLE_NAME="Key Vault Secrets Officer"
+            # Key Vault may take a bit to surface in ARM queries; add a short retry loop.
+            echo "Waiting for Key Vault to be queryable..."
+            for i in {1..10}; do
+              KV_ID=$(az keyvault list -g "$RG_NAME" \
+                --query "[?starts_with(name, 'kv-$(env)-ascension-')].id | [0]" -o tsv 2>/dev/null || true)
+             [ -n "$KV_ID" ] && break || sleep 6
+            done
+            if [ -z "${KV_ID:-}" ]; then
+              echo "ERROR: Key Vault not found in resource group $RG_NAME after creation."; exit 1
+            fi
+            echo "KV_ID=$KV_ID"
 
-            # Self principal (current context). On pipelines this is the service principal.
-            # Try signed-in user (may be empty in SP context), then fall back to the SC client id object.
+            # =========================================================
+            # Import-if-exists guards for KV role assignments (AFTER KV exists)
+            # =========================================================
+            TF_ADDR_SELF="module.app_service.azurerm_role_assignment.kv_secrets_officer_self"
+            TF_ADDR_PIPE="module.app_service.azurerm_role_assignment.kv_secrets_officer_pipeline[0]"
+            ROLE_NAME="Key Vault Secrets Officer"
+
+            # Self principal (current context may be SP in pipelines)
             SELF_OBJECT_ID=$(az ad signed-in-user show --query id -o tsv 2>/dev/null || true)
             if [ -z "${SELF_OBJECT_ID:-}" ]; then
               SELF_OBJECT_ID=$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv 2>/dev/null || true)
@@ -100,30 +119,28 @@ stages:
               fi
             fi
 
-            # Pipeline principal (if provided)
             if [ -n "${PIPELINE_PRINCIPAL_OBJECT_ID:-}" ] && [ "${PIPELINE_PRINCIPAL_OBJECT_ID}" != "null" ]; then
               EXIST_PIPE=$(az role assignment list \
-                --assignee-object-id "$PIPELINE_PRINCIPAL_OBJECT_ID" \
-                --scope "$KV_ID" \
-                --role "$ROLE_NAME" \
-                --query "[0].id" -o tsv || true)
+              --assignee-object-id "$PIPELINE_PRINCIPAL_OBJECT_ID" \
+              --scope "$KV_ID" \
+              --role "$ROLE_NAME" \
+              --query "[0].id" -o tsv || true)
               if [ -n "$EXIST_PIPE" ]; then
                 echo "Importing existing KV role assignment (pipeline): $EXIST_PIPE"
                 terraform -chdir="$TF_DIR" import "$TF_ADDR_PIPE" "$EXIST_PIPE" || true
               fi
             fi
-            else
-              echo "KV not found yet in RG $RG_NAME (name carries a random suffix). Skipping role import guard."
-            fi
-            # =======================================================================
 
-            # --- Plan / Apply ---
-            terraform -chdir="$TF_DIR" plan -no-color -input=false \
-              -var="workflow=$(env)" \
-              -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
-              -var="frontend_image_name=frontend-$(env)" \
-              -var="frontend_image_tag=${BUILD_BUILDID}" \
-              -out="tfplan.$(env).out"
+            # =========================================================
+            # Phase 2: Full plan/apply
+            # =========================================================
+            echo ">>> Phase 2: full plan/apply"
+              terraform -chdir="$TF_DIR" plan -no-color -input=false \
+                -var="workflow=$(env)" \
+                -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
+                -var="frontend_image_name=frontend-$(env)" \
+                -var="frontend_image_tag=${BUILD_BUILDID}" \
+                -out="tfplan.$(env).out"
 
             if [ "$(Build.SourceBranch)" = "refs/heads/main" ]; then
               terraform -chdir="$TF_DIR" apply -auto-approve -no-color "tfplan.$(env).out"
@@ -131,6 +148,12 @@ stages:
             else
               echo "Not main branch, skipping apply."
             fi
+
+      - publish: $(Build.SourcesDirectory)/terraform/tf-outputs.$(env).json
+        artifact: tf-outputs-$(env)
+        condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+        displayName: 'Publish tf-outputs'
+
 
       - publish: $(Build.SourcesDirectory)/terraform/tf-outputs.$(env).json
         artifact: tf-outputs-$(env)

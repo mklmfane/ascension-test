@@ -93,6 +93,44 @@ data "azurerm_role_definition" "kv_admin" {
   scope = azurerm_key_vault.kv.id
 }
 
+resource "azurerm_role_assignment" "kv_admin_self" {
+  scope              = azurerm_key_vault.kv.id
+
+  role_definition_id = data.azurerm_role_definition.kv_admin.id
+  principal_id       = data.azurerm_client_config.current.object_id
+}
+
+data "azurerm_role_definition" "kv_secrets_officer" {
+  name  = "Key Vault Secrets Officer"
+  scope = azurerm_key_vault.kv.id
+}
+
+resource "azurerm_role_assignment" "kv_secrets_officer_self" {
+  scope              = azurerm_key_vault.kv.id
+
+  role_definition_id = data.azurerm_role_definition.kv_secrets_officer.id
+  principal_id       = data.azurerm_client_config.current.object_id
+}
+
+# (Optional) also grant to your Azure DevOps service connection principal
+resource "azurerm_role_assignment" "kv_secrets_officer_pipeline" {
+  count             = var.pipeline_principal_id == "" ? 0 : 1
+
+  scope             = azurerm_key_vault.kv.id
+  role_definition_id = data.azurerm_role_definition.kv_secrets_officer.id
+  principal_id       = var.pipeline_principal_id
+}
+
+# Allow time for RBAC propagation before creating secrets
+resource "time_sleep" "kv_rbac_delay" {
+  create_duration = "90s"
+  
+  depends_on = [
+    azurerm_role_assignment.kv_admin_self,
+    azurerm_role_assignment.kv_secrets_officer_self,
+    azurerm_role_assignment.kv_secrets_officer_pipeline
+  ]
+}
 
 # Example secret to prove KV wiring (now safe)
 resource "azurerm_key_vault_secret" "example" {
@@ -173,4 +211,3 @@ resource "azurerm_role_assignment" "webapp_kv_read" {
   role_definition_id = data.azurerm_role_definition.kv_secrets_user.id
   principal_id       = azurerm_linux_web_app.react_web.identity[0].principal_id
 }
-

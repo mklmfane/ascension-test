@@ -170,20 +170,43 @@ stages:
       - checkout: self
         clean: true
 
+      # Verify Docker is usable by the agent user
       - bash: |
-          set -euo pipefail
-          # Install Node 18 and npm inside the container (for Core Tools v4)
-          apt-get update
-          apt-get install -y curl ca-certificates gnupg
-          curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
-          apt-get install -y nodejs build-essential
-          node -v
-          npm -v
+          set -e
+          if ! docker info >/dev/null 2>&1; then
+            echo "Docker not accessible. On the VM: install docker.io, add the agent user to the 'docker' group, restart docker & the agent."
+            exit 1
+          fi
+          docker version
+        displayName: 'Verify Docker daemon access'
 
-          # Install Azure Functions Core Tools v4 via npm
+      # Verify Python 3.11 exists locally (installed ahead of time)
+      - bash: |
+          set -e
+          if ! command -v python3.11 >/dev/null; then
+            echo "Python 3.11 not found. Install once on the VM:"
+            echo "sudo add-apt-repository ppa:deadsnakes/ppa -y && sudo apt-get update"
+            echo "sudo apt-get install -y python3.11 python3.11-venv"
+            exit 1
+          fi
+          python3.11 --version
+        displayName: 'Check Python 3.11 present'
+
+      # Install Core Tools v4 without sudo by using a local NPM prefix
+      - task: NodeTool@0
+        inputs:
+          versionSpec: '18.x'
+        displayName: 'Use Node 18.x'
+
+      - bash: |
+          set -e
+          mkdir -p "$HOME/.npm-global"
+          npm config set prefix "$HOME/.npm-global"
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> ~/.bashrc
           npm i -g azure-functions-core-tools@4 --unsafe-perm true
           func --version
-            displayName: 'Install Node 18 + Functions Core Tools v4'
+        displayName: 'Install Azure Functions Core Tools v4 (user prefix)'
 
       - bash: |
           set -euo pipefail

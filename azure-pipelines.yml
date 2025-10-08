@@ -171,9 +171,9 @@ stages:
 
       # Ensure we run Python 3.11 (Functions v4 supports 3.11; your agent has 3.13)
       - task: UsePythonVersion@0
-        displayName: 'Use Python 3.11'
+        displayName: 'Use Python 3.13.3'
         inputs:
-          versionSpec: '3.11'
+          versionSpec: '3.13.3'
           addToPath: true
 
       # Node is needed by Core Tools

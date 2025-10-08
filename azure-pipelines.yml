@@ -11,6 +11,7 @@ variables:
   RG_NAME_PREFIX: 'ascension-up'
   location: 'westeurope'   # only used if you later create state infra, etc.
 
+stages:
 # ========= BUILD ONCE =========
 - stage: build
   displayName: 'Build & package apps'

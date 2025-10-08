@@ -179,7 +179,6 @@ stages:
 - stage: deploy_apps
   displayName: "Deploy frontend & function (matrix)"
   dependsOn:
-    - build
     - deploy_infra
   condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
   jobs:
@@ -237,9 +236,6 @@ stages:
 - stage: destroy
   displayName: "Terraform destroy (guarded)"
   dependsOn:
-    - build
-    - tf
-    - deploy_infra
     - deploy_apps
   condition: and(succeeded(), eq(variables['doDestroy'], 'true'))
   jobs:

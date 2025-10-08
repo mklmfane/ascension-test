@@ -24,16 +24,6 @@ variable "vnet_virtual_network_name" {
   type        = string
 }
 
-variable "vnet_address_space" {  
-  description = "Address space for the VNet"
-  type = list(string)  
-}
-
-
-variable "subnet_integration_cidr" {  
-   description = "CIDR for the integration subnet"
-   type = string
-}
 
 variable "web_plan_sku" {
   description = "SKU for Web App plan"
@@ -49,6 +39,17 @@ variable "create_kv_bootstrap_secret" {
     type = bool
     default = true 
 }
+
+variable "subnet_integration_cidr" {
+  description = "CIDR for the integration subnet (must be within the VNet range)."
+  type        = string
+  default     = ""
+}
+
+#variable "vnet_address_space" {
+#  description = "VNet address space (list of CIDRs)."
+#  type        = list(string)
+#}
 
 variable "tags" {
   description = "Common tags"

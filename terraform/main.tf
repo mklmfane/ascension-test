@@ -2,14 +2,11 @@ locals {
   environment         = var.workflow
   resource_group_name = "ascension-up-${local.environment}-rg"
 
+
   # Use your existing base name variable if you have it (var.vnet_name = "vnetone" by default)
   vnet_name           = "ascension-up-${local.environment}-vnet"
 
-  # Pick the environment's dedicated CIDR
   vnet_address_space       = var.address_space_by_env[local.environment]
-
-  #Subnet integration CIDR
-  subnet_integ_cidr   = var.subnet_integration_cidr_by_env[local.environment]
 
   tags = merge(var.tags,
     { 

@@ -5,7 +5,7 @@ locals {
 
   tags = merge(var.tags,
     { 
-        environment = "${var.environment}"
+      environment = var.environment
     })
 }
 

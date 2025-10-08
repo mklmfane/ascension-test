@@ -38,6 +38,7 @@ variable "subnet_integration_cidr_by_env" {
   }
 }
 
+
 variable "web_plan_sku" {
   description = "SKU for Web App Service Plan"
   type        = string
@@ -63,12 +64,6 @@ variable "create_kv_bootstrap_secret" {
   default     = false
 }
 
-# optional temporary IPs so your CLI/agent can reach KV while firewall is Deny
-#variable "kv_bootstrap_ip_rules" {
-#  description = "List of CIDRs temporarily allowed to access Key Vault (e.g., [\"203.0.113.10/32\"])."
-#  type        = list(string)
-#  default     = []
-#}
 
 variable "pipeline_principal_id" {
   description = "If true, creates a principle_id will be created."

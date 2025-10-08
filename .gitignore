@@ -1,21 +1,21 @@
 # ---------- Terraform ----------
-.terrraform/*
-**/.terraform/*
-terraform.tfstate
-terraform.tfstate.backup
-.terraform.lock.hcl
+terraform/.terrraform/*
+terraform/**/.terraform/*
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/.terraform.lock.hcl
 
 # state, plans, crash logs
 **/*.tfstate
 **/*.tfstate.*
 **/*.tfplan
 **/*.out
-crash.log
-crash.*.log
+terraform/crash.log
+terraform/crash.*.log
 
 # local/secret vars (never commit)
-*.tfvars
-*.tfvars.json
+terraform/*.tfvars
+terraform/*.tfvars.json
 
 
 # ---------- General ----------

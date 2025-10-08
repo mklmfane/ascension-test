@@ -15,7 +15,6 @@ locals {
   })
 }
 
-
 # Lookup only when NOT creating the resource group
 data "azurerm_resource_group" "existing" {
   count = var.create_rg ? 0 : 1

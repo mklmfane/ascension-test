@@ -29,7 +29,7 @@ stages:
         mkdir -p "$(Build.ArtifactStagingDirectory)/frontend" "$(Build.ArtifactStagingDirectory)/function"
         echo "<html><body>placeholder</body></html>" > "$(Build.ArtifactStagingDirectory)/frontend/index.html"
         echo "{}" > "$(Build.ArtifactStagingDirectory)/function/host.json"
-        python - <<'PY'
+        python3 - <<'PY'
           import os, zipfile
           out_dir=os.environ['BUILD_ARTIFACTSTAGINGDIRECTORY']
           # frontend.zip

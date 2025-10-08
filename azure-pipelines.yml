@@ -5,15 +5,15 @@ variables:
   GO_VERSION: '1.24.5'
   TFSEC_VERSION: 'v1.28.14'
   TFLINT_VERSION: 'v0.59.1'
-  doDestroy: 'false'
+  doDestroy: 'true'  # set to 'true' to enable destroy stage
   RG_NAME_PREFIX: 'ascension-up'
   location: 'northeurope'
 
 
 stages:
-# =========================
-# DEV STAGE (build -> infra -> apps)
-# =========================
+# =====================================
+# DEV STAGE (build -> infra -> apps)  #
+# =====================================
 - stage: dev
   displayName: 'DEV'
   variables: { env: 'dev' }
@@ -38,7 +38,6 @@ stages:
 
             BIN_DIR="$(Agent.TempDirectory)/bin"; mkdir -p "$BIN_DIR"; export PATH="$BIN_DIR:$PATH"
             # (install go/tfsec/tflint as before) ...
-
             tflint --init
             tflint --recursive
             tfsec "$(Build.SourcesDirectory)/terraform" || true
@@ -50,13 +49,14 @@ stages:
             ensure_ws() {
               local dir="$1" ws="$2"
               if terraform -chdir="$dir" workspace list | sed 's/*//;s/ //g' | grep -Fxq "$ws"; then
-                terraform -chdir="$dir" workspace select "$ws"
+                  terraform -chdir="$dir" workspace select "$ws"
               else
                 terraform -chdir="$dir" workspace new "$ws"
               fi
             }
             ensure_ws "$TF_DIR" "$(env)"
 
+            # --- Import-if-exists guard for Resource Group ---
             SUB_ID=$(az account show --query id -o tsv)
             RG_NAME="$(RG_NAME_PREFIX)-$(env)-rg"
             if az group exists -n "$RG_NAME"; then
@@ -65,9 +65,59 @@ stages:
               fi
             fi
 
+            # --- Resolve pipeline principal (you already pass it into TF as a var) ---
+            # If you prefer a fixed object id, set PIPELINE_PRINCIPAL_OBJECT_ID directly.
             SC_CLIENT_ID="331a5bcb-b95d-4529-a528-c858e28d9a89"
             PIPELINE_PRINCIPAL_OBJECT_ID=$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)
 
+            # ===== Import-if-exists guards for KV role assignments (BEFORE plan) =====
+            TF_ADDR_SELF="module.app_service.azurerm_role_assignment.kv_secrets_officer_self"
+            TF_ADDR_PIPE="module.app_service.azurerm_role_assignment.kv_secrets_officer_pipeline[0]"
+
+            # Resolve KV id by naming pattern: kv-<env>-ascension-<random>
+            KV_ID=$(az keyvault list -g "$RG_NAME" \
+              --query "[?starts_with(name, 'kv-$(env)-ascension-')].id | [0]" -o tsv || true)
+
+            if [ -n "$KV_ID" ]; then
+              ROLE_NAME="Key Vault Secrets Officer"
+
+            # Self principal (current context). On pipelines this is the service principal.
+            # Try signed-in user (may be empty in SP context), then fall back to the SC client id object.
+            SELF_OBJECT_ID=$(az ad signed-in-user show --query id -o tsv 2>/dev/null || true)
+            if [ -z "${SELF_OBJECT_ID:-}" ]; then
+              SELF_OBJECT_ID=$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv 2>/dev/null || true)
+            fi
+
+            if [ -n "${SELF_OBJECT_ID:-}" ]; then
+              EXIST_SELF=$(az role assignment list \
+                --assignee-object-id "$SELF_OBJECT_ID" \
+                --scope "$KV_ID" \
+                --role "$ROLE_NAME" \
+                --query "[0].id" -o tsv || true)
+              if [ -n "$EXIST_SELF" ]; then
+                echo "Importing existing KV role assignment (self): $EXIST_SELF"
+                terraform -chdir="$TF_DIR" import "$TF_ADDR_SELF" "$EXIST_SELF" || true
+              fi
+            fi
+
+            # Pipeline principal (if provided)
+            if [ -n "${PIPELINE_PRINCIPAL_OBJECT_ID:-}" ] && [ "${PIPELINE_PRINCIPAL_OBJECT_ID}" != "null" ]; then
+              EXIST_PIPE=$(az role assignment list \
+                --assignee-object-id "$PIPELINE_PRINCIPAL_OBJECT_ID" \
+                --scope "$KV_ID" \
+                --role "$ROLE_NAME" \
+                --query "[0].id" -o tsv || true)
+              if [ -n "$EXIST_PIPE" ]; then
+                echo "Importing existing KV role assignment (pipeline): $EXIST_PIPE"
+                terraform -chdir="$TF_DIR" import "$TF_ADDR_PIPE" "$EXIST_PIPE" || true
+              fi
+            fi
+            else
+              echo "KV not found yet in RG $RG_NAME (name carries a random suffix). Skipping role import guard."
+            fi
+            # =======================================================================
+
+            # --- Plan / Apply ---
             terraform -chdir="$TF_DIR" plan -no-color -input=false \
               -var="workflow=$(env)" \
               -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
@@ -87,11 +137,76 @@ stages:
         condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
         displayName: 'Publish tf-outputs'
 
+  # ---- dev_func_local_test ----
+  - job: dev_func_local_test
+    displayName: 'Azure Function: venv + func start + curl + pytest'
+    pool: { name: 'ubuntuvm' }
+    steps:
+      - checkout: self
+        clean: true
+
+      # Install Node for Core Tools (works on self-hosted agents too)
+      - task: NodeTool@0
+        displayName: 'Use Node 18.x'
+        inputs:
+          versionSpec: '18.x'
+
+      - script: npm i -g azure-functions-core-tools@4 --unsafe-perm true
+        displayName: 'Install Azure Functions Core Tools v4'
+
+      - bash: |
+          set -euo pipefail
+          cd "$(Build.SourcesDirectory)/api-function"
+
+          # venv + deps
+          python3 -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+          # local settings
+          cp -f local.settings.example.json local.settings.json
+
+          # start Functions host in background
+          LOG_FILE="$(Build.SourcesDirectory)/.func.log"
+          nohup func start --python > "$LOG_FILE" 2>&1 & echo $! > .func.pid
+
+          echo "Waiting for local endpoint /api/products ..."
+          for i in {1..60}; do
+            if curl -fsS "http://localhost:7071/api/products" > /dev/null; then
+              echo "Endpoint is up."
+              break
+            fi
+            sleep 2
+          done
+
+          echo "Smoke test response:"
+          curl -v "http://localhost:7071/api/products" || true
+
+          # run tests
+          pytest -q
+        displayName: 'Create venv, start func, smoke-test endpoint, run pytest'
+
+      - bash: |
+          set -euo pipefail
+          cd "$(Build.SourcesDirectory)/api-function"
+          if [ -f ".func.pid" ]; then
+            echo "Stopping Functions host (PID $(cat .func.pid)) ..."
+            kill "$(cat .func.pid)" || true
+            pkill -f "func start" || true
+            sleep 2
+          fi
+          echo "Last 200 lines of Functions host log:"
+          tail -n 200 "$(Build.SourcesDirectory)/.func.log" || true
+        displayName: 'Stop func & show logs'
+        condition: always()
+
   # ---- build_dev ----
-  
   - job: build_dev
     displayName: 'Build frontend for React with App Service & package function (dev)'
-    dependsOn: dev_infra
+    dependsOn: 
+      - dev_infra
+      - dev_func_local_test
     pool: { name: 'ubuntuvm' }
     steps:
       - checkout: self
@@ -163,12 +278,17 @@ stages:
           OUT_DIR="$(Build.ArtifactStagingDirectory)/function"
           mkdir -p "$OUT_DIR"
 
-          # sanity checks for your existing function app
+          # Ensure expected files exist
           test -f "$FUNC_SRC/host.json" || { echo "api-function/host.json missing"; exit 1; }
-          # If you have multiple functions, ensure their folders contain function.json
 
+          # vendor deps into .python_packages so they’re part of the zip
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r "$FUNC_SRC/requirements.txt" --target "$FUNC_SRC/.python_packages/lib/site-packages"
+
+          # Zip (exclude venv/.git/__pycache__)
           cd "$FUNC_SRC"
-          zip -r "$OUT_DIR/function.zip" . -x ".*" -x "__pycache__/*" -x "venv/*" >/dev/null
+          zip -r "$OUT_DIR/function.zip" . \
+            -x ".*" -x "__pycache__/*" -x ".venv/*" -x "venv/*" >/dev/null
           echo "Created $OUT_DIR/function.zip"
         displayName: 'Package Python Azure Function (zip)'
 
@@ -243,302 +363,11 @@ stages:
             curl -fsS "https://${FN}.azurewebsites.net/api/products" || true
 
 
-# =========================
-# TEST STAGE
-# =========================
-- stage: test
-  displayName: 'TEST'
-  variables: { env: 'test' }
-  dependsOn: dev
-  jobs:
-  - job: build_test
-    displayName: 'Build & package (test)'
-    pool: { name: 'ubuntuvm' }
-    steps:
-      - checkout: self
-        clean: true
-      - bash: |
-          set -euo pipefail
-          mkdir -p "$(Build.SourcesDirectory)/_pkg/frontend" "$(Build.SourcesDirectory)/_pkg/function"
-          echo "<html><body>placeholder</body></html>" > "$(Build.SourcesDirectory)/_pkg/frontend/index.html"
-          echo "{}" > "$(Build.SourcesDirectory)/_pkg/function/host.json"
-        displayName: 'Create placeholder files'
-      - task: ArchiveFiles@2
-        displayName: 'Zip frontend for frontend React app'
-        inputs:
-          rootFolderOrFile: '$(Build.SourcesDirectory)/_pkg/frontend'
-          includeRootFolder: false
-          archiveType: 'zip'
-          archiveFile: '$(Build.ArtifactStagingDirectory)/frontend/frontend.zip'
-          replaceExistingArchive: true
-      - task: ArchiveFiles@2
-        displayName: 'Zip function for azure function with Python3'
-        inputs:
-          rootFolderOrFile: '$(Build.SourcesDirectory)/_pkg/function'
-          includeRootFolder: false
-          archiveType: 'zip'
-          archiveFile: '$(Build.ArtifactStagingDirectory)/function/function.zip'
-          replaceExistingArchive: true
-
-      - publish: $(Build.ArtifactStagingDirectory)/frontend
-        artifact: frontend
-      
-      - publish: $(Build.ArtifactStagingDirectory)/function
-        artifact: function
-
-  - job: test_infra
-    displayName: 'Deploy infra (test)'
-    dependsOn: build_test
-    pool: { 
-      name: 'ubuntuvm' 
-    }
-    steps:
-      - checkout: self
-        clean: true
-      - task: AzureCLI@2
-        displayName: 'Login + tools + plan/apply (test)'
-        inputs:
-          azureSubscription: '$(serviceConnection)'
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -euo pipefail
-            az account show
-
-            BIN_DIR="$(Agent.TempDirectory)/bin"; mkdir -p "$BIN_DIR"; export PATH="$BIN_DIR:$PATH"
-            # (install go/tfsec/tflint as before) ...
-
-            tflint --init
-            tflint --recursive
-            tfsec "$(Build.SourcesDirectory)/terraform" || true
-
-            TF_DIR="$(Build.SourcesDirectory)/terraform"
-            terraform -chdir="$TF_DIR" init -input=false
-
-            # --- Workspace: create only if missing ---
-            ensure_ws() {
-              local dir="$1" ws="$2"
-              if terraform -chdir="$dir" workspace list | sed 's/*//;s/ //g' | grep -Fxq "$ws"; then
-                terraform -chdir="$dir" workspace select "$ws"
-              else
-                terraform -chdir="$dir" workspace new "$ws"
-              fi
-            }
-            ensure_ws "$TF_DIR" "$(env)"
-
-            SUB_ID=$(az account show --query id -o tsv)
-            RG_NAME="$(RG_NAME_PREFIX)-$(env)-rg"
-            if az group exists -n "$RG_NAME"; then
-              if ! terraform -chdir="$TF_DIR" state show azurerm_resource_group.ascension_test_rg >/dev/null 2>&1; then
-                terraform -chdir="$TF_DIR" import azurerm_resource_group.ascension_test_rg "/subscriptions/$SUB_ID/resourceGroups/$RG_NAME" || true
-              fi
-            fi
-
-            SC_CLIENT_ID="331a5bcb-b95d-4529-a528-c858e28d9a89"
-            PIPELINE_PRINCIPAL_OBJECT_ID=$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)
-
-            terraform -chdir="$TF_DIR" plan -no-color -input=false \
-              -var="workflow=$(env)" \
-              -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
-              -var="frontend_image_name=frontend-$(env)" \
-              -var="frontend_image_tag=${BUILD_BUILDID}" \
-              -out="tfplan.$(env).out"
-
-            if [ "$(Build.SourceBranch)" = "refs/heads/main" ]; then
-              terraform -chdir="$TF_DIR" apply -auto-approve -no-color "tfplan.$(env).out"
-              terraform -chdir="$TF_DIR" output -json > "$TF_DIR/tf-outputs.$(env).json"
-            else
-              echo "Not main branch, skipping apply."
-            fi
-
-      - publish: $(Build.SourcesDirectory)/terraform/tf-outputs.$(env).json
-        artifact: tf-outputs-$(env)
-        condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
-
-  - job: test_apps
-    displayName: 'Deploy apps (test)'
-    dependsOn:
-      - build_test
-      - test_infra
-    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
-    pool: { name: 'ubuntuvm' }
-    steps:
-      - download: current
-        artifact: frontend
-        displayName: 'Get frontend artifact'
-      - download: current
-        artifact: function
-        displayName: 'Get function artifact'
-      - download: current
-        artifact: tf-outputs-$(env)
-        displayName: 'Get tf-outputs artifact'
-      - task: AzureCLI@2
-        displayName: 'Deploy frontend + function (test)'
-        inputs:
-          azureSubscription: '$(serviceConnection)'
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -euo pipefail
-            FRONTEND_ZIP="$(Pipeline.Workspace)/frontend/frontend.zip"
-            FUNCTION_ZIP="$(Pipeline.Workspace)/function/function.zip"
-            TF_OUT="$(Pipeline.Workspace)/tf-outputs-$(env)/tf-outputs.$(env).json"
-            RG=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['resource_group_name']['value'])")
-            WEB=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['react_web_name']['value'])")
-            FN=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['function_name']['value'])")
-            az webapp deployment source config-zip -g "$RG" -n "$WEB" --src "$FRONTEND_ZIP"
-            az functionapp config appsettings set -g "$RG" -n "$FN" --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true
-            az functionapp deployment source config-zip -g "$RG" -n "$FN" --src "$FUNCTION_ZIP"
-            curl -fsS "https://${FN}.azurewebsites.net/api/products" || true
-
-# =========================
-# PROD STAGE
-# =========================
-- stage: prod
-  displayName: 'PROD'
-  variables: { env: 'prod' }
-  dependsOn: test
-  jobs:
-  - job: build_prod
-    displayName: 'Build & package (prod)'
-    pool: { name: 'ubuntuvm' }
-    steps:
-      - checkout: self
-        clean: true
-      - bash: |
-          set -euo pipefail
-          mkdir -p "$(Build.SourcesDirectory)/_pkg/frontend" "$(Build.SourcesDirectory)/_pkg/function"
-          echo "<html><body>placeholder</body></html>" > "$(Build.SourcesDirectory)/_pkg/frontend/index.html"
-          echo "{}" > "$(Build.SourcesDirectory)/_pkg/function/host.json"
-        displayName: 'Create placeholder files'
-      - task: ArchiveFiles@2
-        displayName: 'Zip frontend'
-        inputs:
-          rootFolderOrFile: '$(Build.SourcesDirectory)/_pkg/frontend'
-          includeRootFolder: false
-          archiveType: 'zip'
-          archiveFile: '$(Build.ArtifactStagingDirectory)/frontend/frontend.zip'
-          replaceExistingArchive: true
-      - task: ArchiveFiles@2
-        displayName: 'Zip function'
-        inputs:
-          rootFolderOrFile: '$(Build.SourcesDirectory)/_pkg/function'
-          includeRootFolder: false
-          archiveType: 'zip'
-          archiveFile: '$(Build.ArtifactStagingDirectory)/function/function.zip'
-          replaceExistingArchive: true
-      - publish: $(Build.ArtifactStagingDirectory)/frontend
-        artifact: frontend
-      - publish: $(Build.ArtifactStagingDirectory)/function
-        artifact: function
-
-  - job: prod_infra
-    displayName: 'Deploy infra (prod)'
-    dependsOn: build_prod
-    pool: { name: 'ubuntuvm' }
-    steps:
-      - checkout: self
-        clean: true
-      - task: AzureCLI@2
-        displayName: 'Login + tools + plan/apply (prod)'
-        inputs:
-          azureSubscription: '$(serviceConnection)'
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -euo pipefail
-            az account show
-
-            BIN_DIR="$(Agent.TempDirectory)/bin"; mkdir -p "$BIN_DIR"; export PATH="$BIN_DIR:$PATH"
-            # (install go/tfsec/tflint as before) ...
-
-            tflint --init
-            tflint --recursive
-            tfsec "$(Build.SourcesDirectory)/terraform" || true
-
-            TF_DIR="$(Build.SourcesDirectory)/terraform"
-            terraform -chdir="$TF_DIR" init -input=false
-
-            # --- Workspace: create only if missing ---
-            ensure_ws() {
-              local dir="$1" ws="$2"
-              if terraform -chdir="$dir" workspace list | sed 's/*//;s/ //g' | grep -Fxq "$ws"; then
-                terraform -chdir="$dir" workspace select "$ws"
-              else
-                terraform -chdir="$dir" workspace new "$ws"
-              fi
-            }
-            ensure_ws "$TF_DIR" "$(env)"
-
-            SUB_ID=$(az account show --query id -o tsv)
-            RG_NAME="$(RG_NAME_PREFIX)-$(env)-rg"
-            if az group exists -n "$RG_NAME"; then
-              if ! terraform -chdir="$TF_DIR" state show azurerm_resource_group.ascension_test_rg >/dev/null 2>&1; then
-                terraform -chdir="$TF_DIR" import azurerm_resource_group.ascension_test_rg "/subscriptions/$SUB_ID/resourceGroups/$RG_NAME" || true
-              fi
-            fi
-
-            SC_CLIENT_ID="331a5bcb-b95d-4529-a528-c858e28d9a89"
-            PIPELINE_PRINCIPAL_OBJECT_ID=$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)
-
-            terraform -chdir="$TF_DIR" plan -no-color -input=false \
-              -var="workflow=$(env)" \
-              -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
-              -var="frontend_image_name=frontend-$(env)" \
-              -var="frontend_image_tag=${BUILD_BUILDID}" \
-              -out="tfplan.$(env).out"
-
-            if [ "$(Build.SourceBranch)" = "refs/heads/main" ]; then
-              terraform -chdir="$TF_DIR" apply -auto-approve -no-color "tfplan.$(env).out"
-              terraform -chdir="$TF_DIR" output -json > "$TF_DIR/tf-outputs.$(env).json"
-            else
-              echo "Not main branch, skipping apply."
-            fi
-
-      - publish: $(Build.SourcesDirectory)/terraform/tf-outputs.$(env).json
-        artifact: tf-outputs-$(env)
-        condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
-
-  - job: prod_apps
-    displayName: 'Deploy apps (prod)'
-    dependsOn:
-      - build_prod
-      - prod_infra
-    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
-    pool: { name: 'ubuntuvm' }
-    steps:
-      - download: current
-        artifact: frontend
-        displayName: 'Get frontend artifact'
-      - download: current
-        artifact: function
-        displayName: 'Get function artifact'
-      - download: current
-        artifact: tf-outputs-$(env)
-        displayName: 'Get tf-outputs artifact'
-      - task: AzureCLI@2
-        displayName: 'Deploy frontend + function (prod)'
-        inputs:
-          azureSubscription: '$(serviceConnection)'
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -euo pipefail
-            FRONTEND_ZIP="$(Pipeline.Workspace)/frontend/frontend.zip"
-            FUNCTION_ZIP="$(Pipeline.Workspace)/function/function.zip"
-            TF_OUT="$(Pipeline.Workspace)/tf-outputs-$(env)/tf-outputs.$(env).json"
-            RG=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['resource_group_name']['value'])")
-            WEB=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['react_web_name']['value'])")
-            FN=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['function_name']['value'])")
-            az webapp deployment source config-zip -g "$RG" -n "$WEB" --src "$FRONTEND_ZIP"
-            az functionapp config appsettings set -g "$RG" -n "$FN" --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true
-            az functionapp deployment source config-zip -g "$RG" -n "$FN" --src "$FUNCTION_ZIP"
-            curl -fsS "https://${FN}.azurewebsites.net/api/products" || true
-
 # ===== Optional destroy (linear after prod) =====
 - stage: destroy
   displayName: 'Terraform destroy (guarded)'
-  dependsOn: prod
+  #dependsOn: prod
+  dependsOn: dev
   condition: and(succeeded(), eq(variables['doDestroy'], 'true'))
   jobs:
   - job: destroy_all
@@ -546,8 +375,8 @@ stages:
     strategy:
       matrix:
         dev:  { env: dev }
-        test: { env: test }
-        prod: { env: prod }
+        #test: { env: test }
+        #prod: { env: prod }
     steps:
       - checkout: self
         clean: true

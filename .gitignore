@@ -17,7 +17,6 @@ terraform/crash.*.log
 terraform/*.tfvars
 terraform/*.tfvars.json
 
-
 # ---------- General ----------
 .vscode/
 .idea/

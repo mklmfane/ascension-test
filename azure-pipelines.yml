@@ -169,12 +169,33 @@ stages:
       - checkout: self
         clean: true
 
-      # Ensure we run Python 3.11 (Functions v4 supports 3.11; your agent has 3.13)
+
+    # 1) Pin Python 3.11 (Functions v4 supports 3.11/3.10 — NOT 3.12/3.13)
       - task: UsePythonVersion@0
-        displayName: 'Use Python 3.13.3'
+        displayName: 'Use Python 3.11'
         inputs:
-          versionSpec: '3.13.3'
+          versionSpec: '3.11'
           addToPath: true
+        continueOnError: true  # allow fallback on self-hosted
+
+      # 1b) Resolve pythonLocation if the tool cache didn’t provide one (self-hosted)
+      - bash: |
+          set -euo pipefail
+          if [ -z "${pythonLocation:-}" ] || [ ! -x "${pythonLocation}/bin/python" ]; then
+            if command -v python3.11 >/dev/null 2>&1; then
+              PYBIN="$(readlink -f "$(command -v python3.11)")"
+              PYLOC="$(dirname "$(dirname "$PYBIN")")"
+              echo "##vso[task.setvariable variable=pythonLocation]$PYLOC"
+            else
+              echo "Python 3.11 is not available on this agent."
+              echo "Install once on your self-hosted Ubuntu agent:"
+              echo "  sudo add-apt-repository ppa:deadsnakes/ppa -y"
+              echo "  sudo apt-get update && sudo apt-get install -y python3.11 python3.11-venv"
+              exit 1
+            fi
+          fi
+          "${pythonLocation}/bin/python" --version
+        displayName: 'Resolve pythonLocation (3.11)'
 
       # Node is needed by Core Tools
       - task: NodeTool@0

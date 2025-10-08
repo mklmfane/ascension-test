@@ -71,8 +71,8 @@ stages:
             PIPELINE_PRINCIPAL_OBJECT_ID=$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)
 
             # ===== Import-if-exists guards for KV role assignments (BEFORE plan) =====
-            TF_ADDR_SELF="module.app_service.azurerm_role_assignment.kv_secrets_officer_self"
-            TF_ADDR_PIPE="module.app_service.azurerm_role_assignment.kv_secrets_officer_pipeline[0]"
+            #TF_ADDR_SELF="module.app_service.azurerm_role_assignment.kv_secrets_officer_self"
+            #TF_ADDR_PIPE="module.app_service.azurerm_role_assignment.kv_secrets_officer_pipeline[0]"
 
             # Resolve KV id by naming pattern: kv-<env>-ascension-<random>
             KV_ID=$(az keyvault list -g "$RG_NAME" \

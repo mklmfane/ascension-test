@@ -161,52 +161,49 @@ stages:
         displayName: 'Publish tf-outputs'
 
 
-  # ---- dev_func_local_test ----
+    # ---- dev_func_local_test ----
   - job: dev_func_local_test
-    displayName: 'Azure Function local test (Python 3.11 in container)'
-    pool: { name: 'ubuntuvm' }
-    container: python:3.11-slim    # ensures Python 3.11 is available
+    displayName: 'Azure Function local test (Python 3.11, no sudo, no container job)'
+    pool: { name: 'ubuntuvm' }   # self-hosted; DO NOT set "container:" so Docker is available
     steps:
       - checkout: self
         clean: true
 
-      # Verify Docker is usable by the agent user
+      # Verify Docker is usable by this agent account
       - bash: |
           set -e
-          if ! docker info >/dev/null 2>&1; then
-            echo "Docker not accessible. On the VM: install docker.io, add the agent user to the 'docker' group, restart docker & the agent."
-            exit 1
-          fi
-          docker version
-        displayName: 'Verify Docker daemon access'
-
-      - bash: |
-          set -e
-          echo "whoami: $(whoami)"
-          id
+          echo "whoami: $(whoami)"; id
           echo "Socket perms:"; ls -l /var/run/docker.sock || true
           docker info >/dev/null
           docker version
         displayName: 'Verify Docker daemon access (self-hosted)'
 
-      # Verify Python 3.11 exists locally (installed ahead of time)
+      # Resolve an interpreter path (prefer python3.11), store to $(PY)
       - bash: |
           set -e
-          if ! command -v python3.11 >/dev/null; then
-            echo "Python 3.11 not found. Install once on the VM:"
-            echo "sudo add-apt-repository ppa:deadsnakes/ppa -y && sudo apt-get update"
-            echo "sudo apt-get install -y python3.11 python3.11-venv"
+          PY=""
+          if command -v python3.11 >/dev/null 2>&1; then
+            PY="$(command -v python3.11)"
+          elif command -v python3 >/dev/null 2>&1; then
+            PY="$(command -v python3)"
+          elif command -v python >/dev/null 2>&1; then
+            PY="$(command -v python)"
+          else
+            echo "No python interpreter found on agent. Install python3.11 (recommended) or python3." >&2
             exit 1
           fi
-          python3.11 --version
-        displayName: 'Check Python 3.11 present'
+          echo "Using python at: $PY"
+          "$PY" --version
+          echo "##vso[task.setvariable variable=PY]$PY"
+        displayName: 'Resolve Python (prefer 3.11)'
 
-      # Install Core Tools v4 without sudo by using a local NPM prefix
+      # Node is needed by Functions Core Tools
       - task: NodeTool@0
         inputs:
           versionSpec: '18.x'
         displayName: 'Use Node 18.x'
 
+      # Install Core Tools v4 without sudo (user-scoped prefix)
       - bash: |
           set -e
           mkdir -p "$HOME/.npm-global"
@@ -215,39 +212,40 @@ stages:
           echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> ~/.bashrc
           npm i -g azure-functions-core-tools@4 --unsafe-perm true
           func --version
-        displayName: 'Install Azure Functions Core Tools v4 (user prefix)'
+        displayName: 'Install Azure Functions Core Tools v4 (user)'
 
       - bash: |
           set -euo pipefail
+          export PATH="$HOME/.npm-global/bin:$PATH"
           cd "$(Build.SourcesDirectory)/api-function"
 
-          # Create venv with Python 3.11 (in the container)
-          python -m venv .venv
+          # venv + deps with resolved interpreter
+          "$PY" -m venv .venv
           . .venv/bin/activate
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-          # Ensure imports like "from Products import main" work
+          # Ensure package-style imports work during tests/host
           export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 
-          # Ensure local.settings.json & worker runtime
+          # Ensure local.settings.json & worker runtime exist
           if [ ! -f local.settings.json ]; then
             if [ -f local.settings.example.json ]; then
               cp -f local.settings.example.json local.settings.json
             else
               cat > local.settings.json <<'JSON'
-                {
-                  "IsEncrypted": false,
-                  "Values": {
-                    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
-                    "FUNCTIONS_WORKER_RUNTIME": "python"
-                  }
+              {
+                "IsEncrypted": false,
+                "Values": {
+                  "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+                  "FUNCTIONS_WORKER_RUNTIME": "python"
                 }
+              }
               JSON
             fi
           fi
 
-          # Start Functions host in background and wait for readiness
+          # Start Functions host and wait for readiness
           LOG_FILE="$(Build.SourcesDirectory)/.func.log"
           PID_FILE="$(Build.SourcesDirectory)/.func.pid"
           nohup func start --python --port 7071 --verbose > "$LOG_FILE" 2>&1 & echo $! > "$PID_FILE"
@@ -273,7 +271,7 @@ stages:
 
           echo "Running pytest…"
           pytest -q
-        displayName: 'Create venv (py3.11), start func, smoke-test, pytest'
+        displayName: 'Create venv, start func, smoke-test, pytest'
 
       - bash: |
           set -euo pipefail
@@ -289,7 +287,7 @@ stages:
           tail -n 200 "$LOG_FILE" || true
         displayName: 'Stop func & show logs'
         condition: always()
-
+        
   # ---- build_dev ----
   - job: build_dev
     displayName: 'Build frontend for React with App Service & package function (dev)'

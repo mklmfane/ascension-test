@@ -164,9 +164,7 @@ stages:
   # ---- dev_func_local_test ----
   - job: dev_func_local_test
     displayName: 'Azure Function local test (Python 3.11 in container)'
-    #pool: { name: 'ubuntuvm' }
-    pool:
-      vmImage: 'ubuntu-latest'   # <-- hosted agent has Docker preconfigured
+    pool: { name: 'ubuntuvm' }
     container: python:3.11-slim    # ensures Python 3.11 is available
     steps:
       - checkout: self

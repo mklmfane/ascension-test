@@ -8,6 +8,9 @@ locals {
   # Pick the environment's dedicated CIDR
   vnet_address_space       = var.address_space_by_env[local.environment]
 
+  #Subnet integration CIDR
+  subnet_integ_cidr   = var.subnet_integration_cidr_by_env[local.environment]
+
   tags = merge(var.tags,
     { 
         environment = local.environment 
@@ -16,7 +19,7 @@ locals {
 
 resource "azurerm_resource_group" "ascension_test_rg" {
   name     = local.resource_group_name
-  
+
   location = var.location
   tags     = local.tags
 }

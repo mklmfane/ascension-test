@@ -2,7 +2,6 @@
 # Backend: Python FastAPI Azure Function (MODULE)
 # ---------------------------
 
-
 module "function_python" {
   source                        = "./modules/function_python"
 
@@ -10,16 +9,16 @@ module "function_python" {
   location                      = azurerm_resource_group.ascension_test_rg.location
   resource_group_name           = azurerm_resource_group.ascension_test_rg.name
 
-  # Reuse existing web plan -> avoids second plan create (no 429 path)
+  # Reuse plan & networking from app_service module (this is the dependency!)
   create_new_plan               = false
+  service_plan_id               = module.app_service.service_plan_id
+  vnet_integration_subnet_id    = module.app_service.integration_subnet_id
 
-  service_plan_id               = azurerm_service_plan.appsp.id
+  application_insights_conn_str = module.app_service.app_insights_connection_string
+  key_vault_id                  = module.app_service.key_vault_id
 
-  vnet_integration_subnet_id    = azurerm_subnet.integration.id
-  application_insights_conn_str = azurerm_application_insights.ai.connection_string
-  key_vault_id                  = azurerm_key_vault.kv.id
-
-  func_plan_sku                 = var.func_plan_sku   # ignored when create_new_plan=false
-
+  func_plan_sku                 = var.func_plan_sku
   tags                          = local.tags
+
+  depends_on = [module.app_service]
 }

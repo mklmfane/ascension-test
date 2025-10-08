@@ -21,30 +21,31 @@ stages:
     - checkout: self
       clean: true
 
-    - script: |
+    - bash: |
         set -euo pipefail
+        mkdir -p "$(Build.SourcesDirectory)/_pkg/frontend" "$(Build.SourcesDirectory)/_pkg/function"
+        echo "<html><body>placeholder</body></html>" > "$(Build.SourcesDirectory)/_pkg/frontend/index.html"
+        echo "{}" > "$(Build.SourcesDirectory)/_pkg/function/host.json"
+      displayName: 'Create placeholder files'
 
-        mkdir -p "$(Build.ArtifactStagingDirectory)/frontend" \
-                 "$(Build.ArtifactStagingDirectory)/function"
+    - task: ArchiveFiles@2
+      displayName: 'Zip frontend'
+      inputs:
+        rootFolderOrFile: '$(Build.SourcesDirectory)/_pkg/frontend'
+        includeRootFolder: false
+        archiveType: 'zip'
+        archiveFile: '$(Build.ArtifactStagingDirectory)/frontend/frontend.zip'
+        replaceExistingArchive: true
 
-        echo "<html><body>placeholder</body></html>" > "$(Build.ArtifactStagingDirectory)/frontend/index.html"
-        echo "{}" > "$(Build.ArtifactStagingDirectory)/function/host.json"
+    - task: ArchiveFiles@2
+      displayName: 'Zip function'
+      inputs:
+        rootFolderOrFile: '$(Build.SourcesDirectory)/_pkg/function'
+        includeRootFolder: false
+        archiveType: 'zip'
+        archiveFile: '$(Build.ArtifactStagingDirectory)/function/function.zip'
+        replaceExistingArchive: true
 
-        python3 - <<'PY'
-          import os, zipfile
-          out_dir = os.environ['BUILD_ARTIFACTSTAGINGDIRECTORY']
-
-          # frontend.zip
-          zf = zipfile.ZipFile(os.path.join(out_dir,'frontend','frontend.zip'),'w',zipfile.ZIP_DEFLATED)
-          zf.write(os.path.join(out_dir,'frontend','index.html'),'index.html')
-          zf.close()
-
-          # function.zip
-          zf = zipfile.ZipFile(os.path.join(out_dir,'function','function.zip'),'w',zipfile.ZIP_DEFLATED)
-          zf.write(os.path.join(out_dir,'function','host.json'),'host.json')
-          zf.close()
-        PY
-      displayName: 'Package placeholder frontend & function'
 
     - publish: $(Build.ArtifactStagingDirectory)/frontend
       artifact: frontend

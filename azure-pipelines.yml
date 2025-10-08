@@ -180,6 +180,15 @@ stages:
           docker version
         displayName: 'Verify Docker daemon access'
 
+      - bash: |
+          set -e
+          echo "whoami: $(whoami)"
+          id
+          echo "Socket perms:"; ls -l /var/run/docker.sock || true
+          docker info >/dev/null
+          docker version
+        displayName: 'Verify Docker daemon access (self-hosted)'
+
       # Verify Python 3.11 exists locally (installed ahead of time)
       - bash: |
           set -e

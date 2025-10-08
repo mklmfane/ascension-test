@@ -162,106 +162,79 @@ stages:
 
 
   # ---- dev_func_local_test ----
+
   - job: dev_func_local_test
-    displayName: 'Azure Function: venv (py3.11) + func start + curl + pytest'
+    displayName: 'Azure Function local test (Python 3.11 in container)'
     pool: { name: 'ubuntuvm' }
+    container: python:3.11-slim    # ensures Python 3.11 is available
     steps:
       - checkout: self
         clean: true
 
-
-    # 1) Pin Python 3.11 (Functions v4 supports 3.11/3.10 — NOT 3.12/3.13)
-      - task: UsePythonVersion@0
-        displayName: 'Use Python 3.11'
-        inputs:
-          versionSpec: '3.11'
-          addToPath: true
-        continueOnError: true  # allow fallback on self-hosted
-
-      # 1b) Resolve pythonLocation if the tool cache didn’t provide one (self-hosted)
       - bash: |
           set -euo pipefail
-          if [ -z "${pythonLocation:-}" ] || [ ! -x "${pythonLocation}/bin/python" ]; then
-            if command -v python3.11 >/dev/null 2>&1; then
-              PYBIN="$(readlink -f "$(command -v python3.11)")"
-              PYLOC="$(dirname "$(dirname "$PYBIN")")"
-              echo "##vso[task.setvariable variable=pythonLocation]$PYLOC"
-            else
-              echo "Python 3.11 is not available on this agent."
-              echo "Install once on your self-hosted Ubuntu agent:"
-              echo "  sudo add-apt-repository ppa:deadsnakes/ppa -y"
-              echo "  sudo apt-get update && sudo apt-get install -y python3.11 python3.11-venv"
-              exit 1
-            fi
-          fi
-          "${pythonLocation}/bin/python" --version
-        displayName: 'Resolve pythonLocation (3.11)'
+          # Install Node 18 and npm inside the container (for Core Tools v4)
+          apt-get update
+          apt-get install -y curl ca-certificates gnupg
+          curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+          apt-get install -y nodejs build-essential
+          node -v
+          npm -v
 
-      # Node is needed by Core Tools
-      - task: NodeTool@0
-        displayName: 'Use Node 18.x'
-        inputs:
-          versionSpec: '18.x'
-
-      - script: npm i -g azure-functions-core-tools@4 --unsafe-perm true
-        displayName: 'Install Azure Functions Core Tools v4'
+          # Install Azure Functions Core Tools v4 via npm
+          npm i -g azure-functions-core-tools@4 --unsafe-perm true
+          func --version
+            displayName: 'Install Node 18 + Functions Core Tools v4'
 
       - bash: |
           set -euo pipefail
           cd "$(Build.SourcesDirectory)/api-function"
 
-          echo "Python selected by UsePythonVersion:"
-          which python
-          python --version
-
-          # --- Create venv with the pinned 3.11 interpreter ---
-          # $(pythonLocation) is set by UsePythonVersion@0
-          "${pythonLocation}/bin/python" -m venv .venv
-          source .venv/bin/activate
+          # Create venv with Python 3.11 (in the container)
+          python -m venv .venv
+          . .venv/bin/activate
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-          # Make 'from Products import main' imports resolve when running pytest/host
+          # Ensure imports like "from Products import main" work
           export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 
-          # Ensure local.settings.json exists and has FUNCTIONS_WORKER_RUNTIME=python
+          # Ensure local.settings.json & worker runtime
           if [ ! -f local.settings.json ]; then
             if [ -f local.settings.example.json ]; then
               cp -f local.settings.example.json local.settings.json
             else
               cat > local.settings.json <<'JSON'
-              {
-                "IsEncrypted": false,
-                "Values": {
-                  "AzureWebJobsStorage": "UseDevelopmentStorage=true",
-                  "FUNCTIONS_WORKER_RUNTIME": "python"
+                {
+                  "IsEncrypted": false,
+                  "Values": {
+                    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+                    "FUNCTIONS_WORKER_RUNTIME": "python"
+                  }
                 }
-              }
               JSON
             fi
           fi
 
-          # --- Start Functions host in background (verbose) with IPv4 ---
+          # Start Functions host in background and wait for readiness
           LOG_FILE="$(Build.SourcesDirectory)/.func.log"
           PID_FILE="$(Build.SourcesDirectory)/.func.pid"
           nohup func start --python --port 7071 --verbose > "$LOG_FILE" 2>&1 & echo $! > "$PID_FILE"
 
-          echo "Functions host starting (PID $(cat "$PID_FILE")). Waiting for readiness..."
+          echo "Waiting for Functions host..."
           ready=0
           for i in {1..90}; do
-            # check admin status endpoint (avoids race on ::1)
             if curl -fsS "http://127.0.0.1:7071/admin/host/status" >/dev/null 2>&1; then ready=1; break; fi
-            # or look for the startup log line
             if grep -qE 'Host started|Job host started' "$LOG_FILE" 2>/dev/null; then ready=1; break; fi
-              sleep 2
+            sleep 2
           done
 
           if [ "$ready" -ne 1 ]; then
-            echo "ERROR: Functions host did not become ready. Last 200 log lines:"
+            echo "ERROR: Host not ready. Last 200 log lines:"
             tail -n 200 "$LOG_FILE" || true
-            if [ -f "$PID_FILE" ]; then kill "$(cat "$PID_FILE")" || true; fi
-              pkill -f "func start" || true
-              exit 1
+            kill "$(cat "$PID_FILE")" 2>/dev/null || true
+            pkill -f "func start" || true
+            exit 1
           fi
 
           echo "Smoke test /api/products:"

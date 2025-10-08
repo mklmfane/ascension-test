@@ -19,7 +19,6 @@ stages:
   variables: { env: 'dev' }
   jobs:
   # ---- dev_infra ----
-  # ---- dev_infra ----
   - job: dev_infra
     displayName: 'Provision infra (dev)'
     pool: { name: 'ubuntuvm' }
@@ -247,17 +246,17 @@ stages:
               cp -f local.settings.example.json local.settings.json
             else
               python - "$PWD/local.settings.json" <<'PY'
-                import json, sys, pathlib
-                out = pathlib.Path(sys.argv[1])
-                cfg = {
-                  "IsEncrypted": False,
-                  "Values": {
-                    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
-                    "FUNCTIONS_WORKER_RUNTIME": "python"
-                  }
+              import json, sys, pathlib
+              out = pathlib.Path(sys.argv[1])
+              cfg = {
+                "IsEncrypted": False,
+                "Values": {
+                  "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+                  "FUNCTIONS_WORKER_RUNTIME": "python"
                 }
-                out.write_text(json.dumps(cfg, indent=2))
-                print(f"Wrote {out}")
+              }
+              out.write_text(json.dumps(cfg, indent=2))
+              print(f"Wrote {out}")
               PY
             fi
           fi

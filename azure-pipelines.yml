@@ -14,6 +14,7 @@ stages:
 
 #Build stage to build and publish artifacts for frontend and function apps
 # ---------- BUILD (produces artifacts used by deploy_apps) ----------
+# ---------- BUILD (produces artifacts used by deploy_apps) ----------
 - stage: build
   displayName: 'Build & package apps'
   jobs:
@@ -23,25 +24,34 @@ stages:
     - checkout: self
       clean: true
 
-    # Minimal packaging to avoid download failures; replace with your real build
     - script: |
         set -euo pipefail
-        mkdir -p "$(Build.ArtifactStagingDirectory)/frontend" "$(Build.ArtifactStagingDirectory)/function"
+
+        mkdir -p "$(Build.ArtifactStagingDirectory)/frontend" \
+                 "$(Build.ArtifactStagingDirectory)/function"
+
         echo "<html><body>placeholder</body></html>" > "$(Build.ArtifactStagingDirectory)/frontend/index.html"
         echo "{}" > "$(Build.ArtifactStagingDirectory)/function/host.json"
+
         python3 - <<'PY'
           import os, zipfile
-          out_dir=os.environ['BUILD_ARTIFACTSTAGINGDIRECTORY']
+          out_dir = os.environ['BUILD_ARTIFACTSTAGINGDIRECTORY']
+
           # frontend.zip
           zf = zipfile.ZipFile(os.path.join(out_dir,'frontend','frontend.zip'),'w',zipfile.ZIP_DEFLATED)
-          zf.write(os.path.join(out_dir,'frontend','index.html'),'index.html'); zf.close()
+          zf.write(os.path.join(out_dir,'frontend','index.html'),'index.html')
+          zf.close()
+
           # function.zip
           zf = zipfile.ZipFile(os.path.join(out_dir,'function','function.zip'),'w',zipfile.ZIP_DEFLATED)
-          zf.write(os.path.join(out_dir,'function','host.json'),'host.json'); zf.close()
+          zf.write(os.path.join(out_dir,'function','host.json'),'host.json')
+          zf.close()
         PY
       displayName: 'Package placeholder frontend & function'
+
     - publish: $(Build.ArtifactStagingDirectory)/frontend
       artifact: frontend
+      
     - publish: $(Build.ArtifactStagingDirectory)/function
       artifact: function
 

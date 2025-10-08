@@ -214,9 +214,9 @@ stages:
           FUNCTION_ZIP="$(Pipeline.Workspace)/function/function.zip"
           TF_OUT="$(Pipeline.Workspace)/tf-outputs-$(env)/tf-outputs.$(env).json"
 
-          RG=$(python -c "import json;print(json.load(open('$TF_OUT'))['resource_group_name']['value'])")
-          WEB=$(python -c "import json;print(json.load(open('$TF_OUT'))['react_web_name']['value'])")
-          FN=$(python -c "import json;print(json.load(open('$TF_OUT'))['function_name']['value'])")
+          RG=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['resource_group_name']['value'])")
+          WEB=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['react_web_name']['value'])")
+          FN=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['function_name']['value'])")
 
           az webapp deployment source config-zip -g "$RG" -n "$WEB" --src "$FRONTEND_ZIP"
           az functionapp config appsettings set -g "$RG" -n "$FN" --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true

@@ -168,7 +168,7 @@ stages:
       - checkout: self
         clean: true
 
-      # Install Node for Core Tools (works on self-hosted agents too)
+      # Node is needed for Core Tools v4 (host shell + proxies)
       - task: NodeTool@0
         displayName: 'Use Node 18.x'
         inputs:
@@ -181,46 +181,73 @@ stages:
           set -euo pipefail
           cd "$(Build.SourcesDirectory)/api-function"
 
-          # venv + deps
+          echo "Python version:"
+          python3 --version || true
+
+          # --- Create venv + deps ---
           python3 -m venv .venv
           source .venv/bin/activate
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-          # local settings
+          # Required so 'from Products import main' works when running pytest
+          export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
+
+          # --- local.settings.json ---
           cp -f local.settings.example.json local.settings.json
 
-          # start Functions host in background
+          # --- Start Functions host in background (verbose) ---
           LOG_FILE="$(Build.SourcesDirectory)/.func.log"
-          nohup func start --python > "$LOG_FILE" 2>&1 & echo $! > .func.pid
+          PID_FILE="$(Build.SourcesDirectory)/.func.pid"
+          # prefer IPv4 to avoid ::1 races on some agents
+          nohup func start --python --port 7071 --verbose > "$LOG_FILE" 2>&1 & echo $! > "$PID_FILE"
 
-          echo "Waiting for local endpoint /api/products ..."
-          for i in {1..60}; do
-            if curl -fsS "http://localhost:7071/api/products" > /dev/null; then
-              echo "Endpoint is up."
-              break
+          echo "Functions host starting (PID $(cat "$PID_FILE")). Waiting for readiness..."
+
+          # Wait until either the port is open OR the log says host started
+          ready=0
+          for i in {1..90}; do
+            # check port
+            if curl -fsS "http://127.0.0.1:7071/admin/host/status" >/dev/null 2>&1; then
+              ready=1; break
+            fi
+            # check log message
+            if grep -qE 'Host started|Job host started' "$LOG_FILE" 2>/dev/null; then
+              ready=1; break
             fi
             sleep 2
           done
 
-          echo "Smoke test response:"
-          curl -v "http://localhost:7071/api/products" || true
+          if [ "$ready" -ne 1 ]; then
+            echo "ERROR: Functions host did not become ready. Last 200 log lines:"
+            tail -n 200 "$LOG_FILE" || true
+            # ensure we stop the background process before failing
+            if [ -f "$PID_FILE" ]; then kill "$(cat "$PID_FILE")" || true; fi
+              pkill -f "func start" || true
+              exit 1
+            fi
 
-          # run tests
+          # --- Smoke test the HTTP function ---
+          echo "Smoke test /api/products:"
+          curl -v "http://127.0.0.1:7071/api/products" || true
+
+          # --- Run tests inside repo folder so relative imports work ---
+          echo "Running pytest…"
           pytest -q
         displayName: 'Create venv, start func, smoke-test endpoint, run pytest'
 
       - bash: |
           set -euo pipefail
-          cd "$(Build.SourcesDirectory)/api-function"
-          if [ -f ".func.pid" ]; then
-            echo "Stopping Functions host (PID $(cat .func.pid)) ..."
-            kill "$(cat .func.pid)" || true
+          PID_FILE="$(Build.SourcesDirectory)/.func.pid"
+          LOG_FILE="$(Build.SourcesDirectory)/.func.log"
+          if [ -f "$PID_FILE" ]; then
+            echo "Stopping Functions host (PID $(cat "$PID_FILE")) ..."
+            kill "$(cat "$PID_FILE")" || true
             pkill -f "func start" || true
             sleep 2
           fi
           echo "Last 200 lines of Functions host log:"
-          tail -n 200 "$(Build.SourcesDirectory)/.func.log" || true
+          tail -n 200 "$LOG_FILE" || true
         displayName: 'Stop func & show logs'
         condition: always()
 
@@ -327,11 +354,11 @@ stages:
     condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
     pool: { name: 'ubuntuvm' }
     steps:
-      - download: current
+      - download: current-frontend-image
         artifact: frontend-image
-      - download: current
+      - download: current-azure-function-python
         artifact: function
-      - download: current
+      - download: current-terraform-state-output
         artifact: tf-outputs-$(env)
 
       - task: AzureCLI@2

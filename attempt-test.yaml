@@ -559,10 +559,9 @@ stages:
                     package: '$(Pipeline.Workspace)/function/function.zip'
                     deploymentMethod: 'runFromPackage'
 
-
-# ===========================
-# DESTROY stage (single stage)
-# ===========================
+      # ===========================
+      # DESTROY stage (single stage)
+      # ===========================
       - job: destroy_all
         displayName: 'Destroy all'
         pool: { name: 'ubuntuvm' }

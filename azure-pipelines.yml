@@ -382,20 +382,40 @@ stages:
       # Package Python Azure Function (zip) from api-function/
       - bash: |
           set -euo pipefail
+
           FUNC_SRC="$(Build.SourcesDirectory)/api-function"
           OUT_DIR="$(Build.ArtifactStagingDirectory)/function"
           mkdir -p "$OUT_DIR"
 
           test -f "$FUNC_SRC/host.json" || { echo "api-function/host.json missing"; exit 1; }
 
-          python3 -m pip install --upgrade pip
-          python3 -m pip install -r "$FUNC_SRC/requirements.txt" --target "$FUNC_SRC/.python_packages/lib/site-packages"
+          # --- create & use a venv (avoid PEP 668 system protection) ---
+          VENV_DIR="$(Agent.TempDirectory)/func-venv"
+          python3 -m venv "$VENV_DIR"
+          . "$VENV_DIR/bin/activate"
 
+          # be quiet & fast; no system breakages
+          export PIP_DISABLE_PIP_VERSION_CHECK=1
+          export PIP_NO_PYTHON_VERSION_WARNING=1
+
+          # vendor dependencies into the expected Azure Functions path
+          TARGET_DIR="$FUNC_SRC/.python_packages/lib/site-packages"
+          mkdir -p "$TARGET_DIR"
+          python3 -m pip install --upgrade pip wheel >/dev/null
+          python3 -m pip install -r "$FUNC_SRC/requirements.txt" --target "$TARGET_DIR"
+
+          # clean up pyc etc. (optional)
+          find "$FUNC_SRC" -type f -name '*.pyc' -delete || true
+          find "$FUNC_SRC" -type d -name '__pycache__' -prune -exec rm -rf {} + || true
+
+          # create deployment zip (include .python_packages; exclude venv/git/cache)
           cd "$FUNC_SRC"
           zip -r "$OUT_DIR/function.zip" . \
-            -x ".*" -x "__pycache__/*" -x ".venv/*" -x "venv/*" >/dev/null
+            -x ".git/*" -x ".venv/*" -x "venv/*" -x "$(basename "$VENV_DIR")/*" \
+            -x "__pycache__/*" >/dev/null
+
           echo "Created $OUT_DIR/function.zip"
-        displayName: 'Package Python Azure Function (zip)'
+        displayName: 'Build zip with python source for Azure Function'
 
       # Publish the folder that contains function.zip, name the artifact "function"
       - publish: $(Build.ArtifactStagingDirectory)/function

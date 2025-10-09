@@ -421,7 +421,7 @@ stages:
       - publish: $(Build.ArtifactStagingDirectory)/function
         artifact: function
 
-  # ---- dev_apps ----
+# ---- dev_apps ----
   - job: deploy_apps
     displayName: 'Deploy apps (dev)'
     dependsOn: [ build_dev ]
@@ -432,60 +432,88 @@ stages:
     # Bring in artifacts created in build_dev
       - download: current
         artifact: react-frontend-image
+        displayName: 'Download frontend image metadata'
       - download: current
         artifact: function
+        displayName: 'Download zip package for azure function'
       - download: current
         artifact: tf-outputs-$(env)
+        displayName: 'Download tf outputs reading state'
 
-    # Read names from Terraform outputs (fall back to sane defaults)
-      - bash: |
-          set -euo pipefail
-          TF_OUT="$(Pipeline.Workspace)/tf-outputs-$(env)/tf-outputs.$(env).json"
+    # Resolve RG, Web App, and Function App names (prefer TF outputs, fallback to live Azure)
+      - task: AzureCLI@2
+        displayName: 'Resolve RG / app names from TF outputs or Azure'
+        inputs:
+          azureSubscription: '$(serviceConnection)'
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
 
-          # Defaults (change if yours differ)
-          DEF_WEB="react-web-$(env)"
-          DEF_FUNC="func-$(env)-ascension"
+            TF_OUT="$(Pipeline.Workspace)/tf-outputs-$(env)/tf-outputs.$(env).json"
 
-          WEB_NAME="$DEF_WEB"
-          FUNC_NAME="$DEF_FUNC"
-
-          if [ -s "$TF_OUT" ]; then
-            if command -v jq >/dev/null 2>&1; then
-              WEB_NAME="$(jq -r '.react_web_name.value // .react_web_name // empty' "$TF_OUT")" || true
-              FUNC_NAME="$(jq -r '.function_name.value // .function_name // empty' "$TF_OUT")" || true
-            else
-              # jq not available? very light grep/sed fallback
-              WEB_NAME="$(grep -oP '"react_web_name"\s*:\s*\{[^}]*\}' "$TF_OUT" 2>/dev/null | grep -oP '"value"\s*:\s*"\K[^"]+' || true)"
-              FUNC_NAME="$(grep -oP '"function_name"\s*:\s*\{[^}]*\}' "$TF_OUT" 2>/dev/null | grep -oP '"value"\s*:\s*"\K[^"]+' || true)"
+            # 1) Resolve resource group
+            if [ -s "$TF_OUT" ] && command -v jq >/dev/null 2>&1; then
+              RG="$(jq -r '.resource_group_name.value // .resource_group_name // empty' "$TF_OUT")"
             fi
-          fi
+            RG="${RG:-$(echo "$(RG_NAME_PREFIX)-$(env)-rg")}"
 
-          WEB_NAME="${WEB_NAME:-$DEF_WEB}"
-          FUNC_NAME="${FUNC_NAME:-$DEF_FUNC}"
+            # 2) Try to read names from TF outputs
+            if [ -s "$TF_OUT" ] && command -v jq >/dev/null 2>&1; then
+              WEB_NAME="$(jq -r '.react_web_name.value // .react_web_name // empty' "$TF_OUT")"
+              FUNC_NAME="$(jq -r '.function_name.value // .function_name // empty' "$TF_OUT")"
+            fi
 
-          echo "Resolved WEB_NAME=$WEB_NAME"
-          echo "Resolved FUNC_NAME=$FUNC_NAME"
+            # 3) Fallback: discover in Azure
+            if [ -z "${WEB_NAME:-}" ]; then
+              # Prefer Linux Web Apps
+              WEB_NAME="$(az webapp list -g "$RG" --query "[?contains(kind, 'linux')].name | [0]" -o tsv || true)"
+            fi
 
-          echo "##vso[task.setvariable variable=WEB_NAME]$WEB_NAME"
-          echo "##vso[task.setvariable variable=FUNC_NAME]$FUNC_NAME"
-        displayName: 'Resolve app names from TF outputs (with fallbacks)'
+            if [ -z "${FUNC_NAME:-}" ]; then
+              # Prefer Linux Function Apps
+              FUNC_NAME="$(az functionapp list -g "$RG" --query "[?contains(kind, 'functionapp,linux')].name | [0]" -o tsv || true)"
+              # fallback to any functionapp
+              if [ -z "$FUNC_NAME" ]; then
+                FUNC_NAME="$(az functionapp list -g "$RG" --query "[0].name" -o tsv || true)"
+              fi
+            fi
 
-      # Read container image URI from build artifact and expose as a variable
+            echo "Resolved: RG=$RG WEB_NAME=${WEB_NAME:-<none>} FUNC_NAME=${FUNC_NAME:-<none>}"
+
+            # Guard rails: fail early with a helpful message
+            if [ -z "${WEB_NAME:-}" ]; then
+              echo "ERROR: Could not find a Linux Web App in resource group '$RG'."
+              echo "Tip: ensure Terraform applied on 'main' and created the Web App."
+              az webapp list -g "$RG" -o table || true
+              exit 2
+            fi
+            if [ -z "${FUNC_NAME:-}" ]; then
+              echo "ERROR: Could not find a Function App in resource group '$RG'."
+              az functionapp list -g "$RG" -o table || true
+              exit 3
+            fi
+
+            # Export variables for later tasks
+            echo "##vso[task.setvariable variable=RG]$RG"
+            echo "##vso[task.setvariable variable=WEB_NAME]$WEB_NAME"
+            echo "##vso[task.setvariable variable=FUNC_NAME]$FUNC_NAME"
+
+      # Read container image URI from artifact
       - bash: |
           set -euo pipefail
           META="$(Pipeline.Workspace)/react-frontend-image/image.json"
-
+          if [ ! -s "$META" ]; then
+            echo "ERROR: image.json not found at $META"; exit 1
+          fi
           if command -v jq >/dev/null 2>&1; then
-            IMAGE_URI="$(jq -r '.image_uri' "$META")"
+            IMAGE_URI="$(jq -r '.image_uri // empty' "$META")"
           else
-            IMAGE_URI="$(grep -oP '"image_uri"\s*:\s*"\K[^"]+' "$META")"
+            IMAGE_URI="$(grep -oP '"image_uri"\s*:\s*"\K[^"]+' "$META" || true)"
           fi
-
           if [ -z "${IMAGE_URI:-}" ]; then
-            echo "ERROR: image_uri not found in $META"
-          exit 1
+            echo "ERROR: image_uri missing in $META"; exit 1
           fi
-
           echo "Using IMAGE_URI=$IMAGE_URI"
           echo "##vso[task.setvariable variable=IMAGE_URI]$IMAGE_URI"
         displayName: 'Read container image URI'

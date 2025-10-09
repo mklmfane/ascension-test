@@ -19,7 +19,10 @@ terraform/*.tfvars
 terraform/*.tfvars.json
 
 # ---------- General ----------
-.vscode/
+
 .idea/
 .DS_Store
 *.log
+.vscode/
+**/.venv/*
+**/.funcignore/*

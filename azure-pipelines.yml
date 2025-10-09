@@ -450,24 +450,51 @@ stages:
             test -f "$TF_OUT"   || { echo "Missing TF outputs $TF_OUT"; exit 1; }
             test -f "$IMG_META" || { echo "Missing image metadata $IMG_META"; exit 1; }
 
-            RG=$(jq -r '.resource_group_name.value // empty' "$TF_OUT")
-            WEB=$(jq -r '.react_web_name.value // empty' "$TF_OUT")
-            FN=$(jq -r '.function_name.value // empty' "$TF_OUT")
+            # ---- Read RG from TF outputs (required) ----
+            RG=$(jq -r '.resource_group_name.value // .resource_group_name // empty' "$TF_OUT")
+            test -n "$RG" || { echo "resource_group_name missing in TF outputs"; exit 1; }
 
+            # ---- Try to read names from TF outputs first ----
+            WEB=$(jq -r '.react_web_name.value // .react_web_name // empty' "$TF_OUT")
+            FN=$(jq -r '.function_name.value // .function_name // empty' "$TF_OUT")
+
+            # ---- Fallback discovery in Azure if outputs are absent ----
+            if [ -z "$WEB" ]; then
+              # Prefer Linux web apps in this RG; if you tag with environment, filter on it
+              WEB=$(az webapp list -g "$RG" --query "[?to_string(kind) =~ 'linux'].name | [0]" -o tsv)
+            fi
+
+            if [ -z "$FN" ]; then
+              # Prefer Linux function apps in this RG
+              FN=$(az functionapp list -g "$RG" --query "[?kind =~ 'functionapp,linux'].name | [0]" -o tsv)
+            # If that fails, take the first functionapp of any kind
+            if [ -z "$FN" ]; then
+              FN=$(az functionapp list -g "$RG" --query "[0].name" -o tsv)
+              fi
+            fi
+
+            echo "Resolved resources: RG=$RG WEB=$WEB FN=$FN"
+
+            # Final guard rails
+            [ -n "$WEB" ] || { echo "ERROR: Could not resolve Web App name in RG '$RG'."; exit 2; }
+            [ -n "$FN" ]  || { echo "ERROR: Could not resolve Function App name in RG '$RG'."; exit 3; }
+
+            # ---- Image metadata (from previous build job) ----
             ACR_LOGIN_SERVER=$(jq -r '.acr_login_server // .acr_login_server.value // empty' "$IMG_META")
             IMAGE_URI=$(jq -r '.image_uri // empty' "$IMG_META")
+            test -n "$ACR_LOGIN_SERVER" || { echo "Missing acr_login_server in image metadata"; exit 4; }
+            test -n "$IMAGE_URI"        || { echo "Missing image_uri in image metadata"; exit 5; }
 
-            echo "RG=$RG WEB=$WEB FN=$FN"
             echo "IMAGE_URI=$IMAGE_URI"
 
-            # Ensure target Web App is Linux
+            # ---- Ensure target Web App is Linux ----
             KIND=$(az webapp show -g "$RG" -n "$WEB" --query "kind" -o tsv)
             RESERVED=$(az webapp show -g "$RG" -n "$WEB" --query "reserved" -o tsv)
             if [[ "${RESERVED}" != "true" && "${KIND}" != *"linux"* ]]; then
-              echo "ERROR: Web App '$WEB' is not Linux."; exit 1
+              echo "ERROR: Web App '$WEB' is not Linux (kind=$KIND reserved=$RESERVED)."; exit 6
             fi
 
-            # Configure Web App to use ACR image (managed identity pull)
+            # ---- Point Web App to ACR image ----
             az webapp config container set \
               -g "$RG" -n "$WEB" \
               --docker-custom-image-name "$IMAGE_URI" \
@@ -479,16 +506,16 @@ stages:
               WEBSITES_PORT=80
             az webapp restart -g "$RG" -n "$WEB"
 
-            # Deploy Function zip
+            # ---- Deploy Function zip ----
             FUNCTION_ZIP="$(Pipeline.Workspace)/function/function.zip"
-            test -f "$FUNCTION_ZIP" || { echo "Function zip not found at $FUNCTION_ZIP"; exit 1; }
+            test -f "$FUNCTION_ZIP" || { echo "Function zip not found at $FUNCTION_ZIP"; exit 7; }
+
             az functionapp config appsettings set -g "$RG" -n "$FN" --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true
             az functionapp deployment source config-zip -g "$RG" -n "$FN" --src "$FUNCTION_ZIP"
 
-            # Best-effort smoke check
+            # ---- Smoke / list functions ----
             az functionapp function list -g "$RG" -n "$FN" -o table || true
 
-# ===== Optional destroy (linear after dev) =====
 - stage: destroy
   displayName: 'Terraform destroy (guarded)'
   dependsOn: dev

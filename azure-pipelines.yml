@@ -291,55 +291,67 @@ stages:
             set -euo pipefail
 
             TF_OUT="$(Pipeline.Workspace)/tf-outputs-$(env)/tf-outputs.$(env).json"
-            test -f "$TF_OUT" || { echo "Missing TF outputs at $TF_OUT"; exit 1; }
 
-            # Read RG (required by all fallbacks)
-            RG=$(python3 - <<'PY' "$TF_OUT"
-              import json,sys
-              d=json.load(open(sys.argv[1]))
-              print(d.get('resource_group_name',{}).get('value',''))
-            PY)
-            test -n "$RG" || { echo "resource_group_name missing in TF outputs"; exit 1; }
+            # Derive RG from your pipeline vars (avoids JSON parsing altogether)
+            RG_NAME="${RG_NAME_PREFIX}-$(env)-rg"
 
-            # Try login server directly
-            ACR_LOGIN_SERVER=$(python3 - <<'PY' "$TF_OUT"
-              import json,sys
-              d=json.load(open(sys.argv[1]))
-              print(d.get('acr_login_server',{}).get('value',''))
-            PY)
+            echo "Resource Group will be assumed as: ${RG_NAME}"
+            echo "If present, will also try to read ACR details from: ${TF_OUT}"
 
-            if [ -z "$ACR_LOGIN_SERVER" ]; then
-            # Try ACR name then resolve
-              ACR_NAME=$(python3 - <<'PY' "$TF_OUT"
-              import json,sys
-              d=json.load(open(sys.argv[1]))
-              print(d.get('acr_name',{}).get('value',''))
-            PY)
-            if [ -n "$ACR_NAME" ]; then
-              ACR_LOGIN_SERVER=$(az acr show -g "$RG" -n "$ACR_NAME" --query loginServer -o tsv)
+            ACR_LOGIN_SERVER=""
+
+            # 1) Best-effort: read acr_login_server from the TF outputs JSON using grep/sed (no python/jq)
+            if [ -s "$TF_OUT" ]; then
+              # pull: "acr_login_server": {"value":"X.azurecr.io", ...}
+              ACR_LOGIN_SERVER="$(grep -oP '"acr_login_server"\s*:\s*\{[^}]*\}' "$TF_OUT" 2>/dev/null \
+              | grep -oP '"value"\s*:\s*"\K[^"]+' 2>/dev/null || true)"
+            if [ -n "${ACR_LOGIN_SERVER}" ]; then
+              echo "Found acr_login_server in TF outputs: ${ACR_LOGIN_SERVER}"
             else
-              # Discover: take the only ACR in the RG (or first if multiple)
-              mapfile -t L < <(az acr list -g "$RG" --query "[].loginServer" -o tsv)
-              if [ "${#L[@]}" -eq 0 ]; then
-                echo "No ACR found in RG '$RG' and no outputs provided."; exit 1
+              # try via acr_name -> az show
+              ACR_NAME_FROM_OUT="$(grep -oP '"acr_name"\s*:\s*\{[^}]*\}' "$TF_OUT" 2>/dev/null \
+              | grep -oP '"value"\s*:\s*"\K[^"]+' 2>/dev/null || true)"
+              if [ -n "${ACR_NAME_FROM_OUT}" ]; then
+                echo "Found acr_name in TF outputs: ${ACR_NAME_FROM_OUT}. Resolving loginServer via az..."
+                ACR_LOGIN_SERVER="$(az acr show -g "$RG_NAME" -n "$ACR_NAME_FROM_OUT" --query loginServer -o tsv 2>/dev/null || true)"
               fi
-              ACR_LOGIN_SERVER="${L[0]}"
             fi
+            else
+              echo "TF outputs file missing or empty (ok, will discover via Azure): $TF_OUT"
             fi
 
-            test -n "$ACR_LOGIN_SERVER" || { echo "Could not resolve ACR login server"; exit 1; }
+            # 2) Discovery fallback via Azure (RG must already exist in your subscription)
+            if [ -z "${ACR_LOGIN_SERVER}" ]; then
+              echo "Discovering ACR in RG '${RG_NAME}'..."
+              mapfile -t SERVERS < <(az acr list -g "$RG_NAME" --query "[].loginServer" -o tsv)
+              if [ "${#SERVERS[@]}" -eq 0 ]; then
+                echo "ERROR: No ACR found in resource group '${RG_NAME}', and no TF outputs provided."
+                echo "Diagnostics: az acr list -g '${RG_NAME}' --output table"
+                az acr list -g "$RG_NAME" --output table || true
+                exit 1
+              fi
+
+            if [ "${#SERVERS[@]}" -gt 1 ]; then
+              echo "WARNING: Multiple ACRs found in RG '${RG_NAME}'. Using the first one:"
+              printf ' - %s\n' "${SERVERS[@]}"
+            fi
+              ACR_LOGIN_SERVER="${SERVERS[0]}"
+            fi
+
+            test -n "${ACR_LOGIN_SERVER}" || { echo "Could not resolve ACR login server"; exit 1; }
             ACR_NAME="${ACR_LOGIN_SERVER%%.*}"
-            echo "Using ACR: $ACR_NAME ($ACR_LOGIN_SERVER)"
+            echo "Using ACR: ${ACR_NAME} (${ACR_LOGIN_SERVER})"
 
-            # Docker available?
+            # Ensure Docker is available
             if ! command -v docker >/dev/null 2>&1; then
               echo "Docker not found on agent. Please install & start Docker on 'ubuntuvm'." >&2
               exit 1
             fi
 
-            # Login & build
-            az acr login -n "$ACR_NAME"
+            # Login to ACR
+            az acr login -n "${ACR_NAME}"
 
+            # Build & push
             FRONTEND_DIR="$(Build.SourcesDirectory)/frontend"
             test -f "$FRONTEND_DIR/Dockerfile" || { echo "frontend/Dockerfile not found"; exit 1; }
             test -f "$FRONTEND_DIR/nginx.conf" || { echo "frontend/nginx.conf not found"; exit 1; }
@@ -349,22 +361,23 @@ stages:
             IMAGE_URI="${ACR_LOGIN_SERVER}/${IMG_NAME}:${IMG_TAG}"
 
             echo "Building ${IMAGE_URI} from ${FRONTEND_DIR}"
-            docker build -t "$IMAGE_URI" "$FRONTEND_DIR"
-            docker push "$IMAGE_URI"
+            docker build -t "${IMAGE_URI}" "${FRONTEND_DIR}"
+            docker push "${IMAGE_URI}"
 
+            # Save metadata for the deploy stage
             META_DIR="$(Build.ArtifactStagingDirectory)/frontend-image"
             mkdir -p "$META_DIR"
             cat > "$META_DIR/image.json" <<EOF
-              {
-                "acr_login_server": "$ACR_LOGIN_SERVER",
-                "image_name": "$IMG_NAME",
-                "image_tag": "$IMG_TAG",
-                "image_uri": "$IMAGE_URI"
+            {
+              "acr_login_server": "${ACR_LOGIN_SERVER}",
+              "image_name": "${IMG_NAME}",
+              "image_tag": "${IMG_TAG}",
+              "image_uri": "${IMAGE_URI}"
             }
             EOF
-
-      - publish: $(Build.ArtifactStagingDirectory)/frontend-image
-        artifact: frontend-image
+            
+      - publish: $(Build.ArtifactStagingDirectory)/react-frontend-image
+        artifact: react-frontend-image
 
       # Package Python Azure Function (zip) from api-function/
       - bash: |

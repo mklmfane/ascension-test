@@ -427,7 +427,9 @@ stages:
     dependsOn: [ build_dev ]
     condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
     pool: { name: 'ubuntuvm' }
+
     steps:
+    # Bring in artifacts created in build_dev
       - download: current
         artifact: react-frontend-image
       - download: current
@@ -435,86 +437,76 @@ stages:
       - download: current
         artifact: tf-outputs-$(env)
 
-      - task: AzureCLI@2
-        displayName: 'Point Web App to ACR image (Linux) + Deploy Function Zip'
+    # Read names from Terraform outputs (fall back to sane defaults)
+      - bash: |
+          set -euo pipefail
+          TF_OUT="$(Pipeline.Workspace)/tf-outputs-$(env)/tf-outputs.$(env).json"
+
+          # Defaults (change if yours differ)
+          DEF_WEB="react-web-$(env)"
+          DEF_FUNC="func-$(env)-ascension"
+
+          WEB_NAME="$DEF_WEB"
+          FUNC_NAME="$DEF_FUNC"
+
+          if [ -s "$TF_OUT" ]; then
+            if command -v jq >/dev/null 2>&1; then
+              WEB_NAME="$(jq -r '.react_web_name.value // .react_web_name // empty' "$TF_OUT")" || true
+              FUNC_NAME="$(jq -r '.function_name.value // .function_name // empty' "$TF_OUT")" || true
+            else
+              # jq not available? very light grep/sed fallback
+              WEB_NAME="$(grep -oP '"react_web_name"\s*:\s*\{[^}]*\}' "$TF_OUT" 2>/dev/null | grep -oP '"value"\s*:\s*"\K[^"]+' || true)"
+              FUNC_NAME="$(grep -oP '"function_name"\s*:\s*\{[^}]*\}' "$TF_OUT" 2>/dev/null | grep -oP '"value"\s*:\s*"\K[^"]+' || true)"
+            fi
+          fi
+
+          WEB_NAME="${WEB_NAME:-$DEF_WEB}"
+          FUNC_NAME="${FUNC_NAME:-$DEF_FUNC}"
+
+          echo "Resolved WEB_NAME=$WEB_NAME"
+          echo "Resolved FUNC_NAME=$FUNC_NAME"
+
+          echo "##vso[task.setvariable variable=WEB_NAME]$WEB_NAME"
+          echo "##vso[task.setvariable variable=FUNC_NAME]$FUNC_NAME"
+        displayName: 'Resolve app names from TF outputs (with fallbacks)'
+
+      # Read container image URI from build artifact and expose as a variable
+      - bash: |
+          set -euo pipefail
+          META="$(Pipeline.Workspace)/react-frontend-image/image.json"
+
+          if command -v jq >/dev/null 2>&1; then
+            IMAGE_URI="$(jq -r '.image_uri' "$META")"
+          else
+            IMAGE_URI="$(grep -oP '"image_uri"\s*:\s*"\K[^"]+' "$META")"
+          fi
+
+          if [ -z "${IMAGE_URI:-}" ]; then
+            echo "ERROR: image_uri not found in $META"
+          exit 1
+          fi
+
+          echo "Using IMAGE_URI=$IMAGE_URI"
+          echo "##vso[task.setvariable variable=IMAGE_URI]$IMAGE_URI"
+        displayName: 'Read container image URI'
+
+      # Deploy container to the Linux Web App (built-in task)
+      - task: AzureWebAppContainer@1
+        displayName: 'Point Web App to ACR image'
         inputs:
           azureSubscription: '$(serviceConnection)'
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -euo pipefail
+          appName: '$(WEB_NAME)'
+          containers: '$(IMAGE_URI)'
 
-            TF_OUT="$(Pipeline.Workspace)/tf-outputs-$(env)/tf-outputs.$(env).json"
-            IMG_META="$(Pipeline.Workspace)/react-frontend-image/image.json"
-
-            test -f "$TF_OUT"   || { echo "Missing TF outputs $TF_OUT"; exit 1; }
-            test -f "$IMG_META" || { echo "Missing image metadata $IMG_META"; exit 1; }
-
-            # ---- Read RG from TF outputs (required) ----
-            RG=$(jq -r '.resource_group_name.value // .resource_group_name // empty' "$TF_OUT")
-            test -n "$RG" || { echo "resource_group_name missing in TF outputs"; exit 1; }
-
-            # ---- Try to read names from TF outputs first ----
-            WEB=$(jq -r '.react_web_name.value // .react_web_name // empty' "$TF_OUT")
-            FN=$(jq -r '.function_name.value // .function_name // empty' "$TF_OUT")
-
-            # ---- Fallback discovery in Azure if outputs are absent ----
-            if [ -z "$WEB" ]; then
-              # Prefer Linux web apps in this RG; if you tag with environment, filter on it
-              WEB=$(az webapp list -g "$RG" --query "[?to_string(kind) =~ 'linux'].name | [0]" -o tsv)
-            fi
-
-            if [ -z "$FN" ]; then
-              # Prefer Linux function apps in this RG
-              FN=$(az functionapp list -g "$RG" --query "[?kind =~ 'functionapp,linux'].name | [0]" -o tsv)
-            # If that fails, take the first functionapp of any kind
-            if [ -z "$FN" ]; then
-              FN=$(az functionapp list -g "$RG" --query "[0].name" -o tsv)
-              fi
-            fi
-
-            echo "Resolved resources: RG=$RG WEB=$WEB FN=$FN"
-
-            # Final guard rails
-            [ -n "$WEB" ] || { echo "ERROR: Could not resolve Web App name in RG '$RG'."; exit 2; }
-            [ -n "$FN" ]  || { echo "ERROR: Could not resolve Function App name in RG '$RG'."; exit 3; }
-
-            # ---- Image metadata (from previous build job) ----
-            ACR_LOGIN_SERVER=$(jq -r '.acr_login_server // .acr_login_server.value // empty' "$IMG_META")
-            IMAGE_URI=$(jq -r '.image_uri // empty' "$IMG_META")
-            test -n "$ACR_LOGIN_SERVER" || { echo "Missing acr_login_server in image metadata"; exit 4; }
-            test -n "$IMAGE_URI"        || { echo "Missing image_uri in image metadata"; exit 5; }
-
-            echo "IMAGE_URI=$IMAGE_URI"
-
-            # ---- Ensure target Web App is Linux ----
-            KIND=$(az webapp show -g "$RG" -n "$WEB" --query "kind" -o tsv)
-            RESERVED=$(az webapp show -g "$RG" -n "$WEB" --query "reserved" -o tsv)
-            if [[ "${RESERVED}" != "true" && "${KIND}" != *"linux"* ]]; then
-              echo "ERROR: Web App '$WEB' is not Linux (kind=$KIND reserved=$RESERVED)."; exit 6
-            fi
-
-            # ---- Point Web App to ACR image ----
-            az webapp config container set \
-              -g "$RG" -n "$WEB" \
-              --docker-custom-image-name "$IMAGE_URI" \
-              --docker-registry-server-url "https://${ACR_LOGIN_SERVER}" || true
-
-            az webapp config set -g "$RG" -n "$WEB" --acr-use-managed-identity
-            az webapp config appsettings set -g "$RG" -n "$WEB" --settings \
-              WEBSITES_ENABLE_APP_SERVICE_STORAGE=false \
-              WEBSITES_PORT=80
-            az webapp restart -g "$RG" -n "$WEB"
-
-            # ---- Deploy Function zip ----
-            FUNCTION_ZIP="$(Pipeline.Workspace)/function/function.zip"
-            test -f "$FUNCTION_ZIP" || { echo "Function zip not found at $FUNCTION_ZIP"; exit 7; }
-
-            az functionapp config appsettings set -g "$RG" -n "$FN" --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true
-            az functionapp deployment source config-zip -g "$RG" -n "$FN" --src "$FUNCTION_ZIP"
-
-            # ---- Smoke / list functions ----
-            az functionapp function list -g "$RG" -n "$FN" -o table || true
+      # Deploy the Python Azure Function zip (built-in task)
+      - task: AzureFunctionApp@2
+        displayName: 'Deploy Python Function (run-from-package)'
+        inputs:
+          connectedServiceNameARM: '$(serviceConnection)'
+          appType: 'functionAppLinux'
+          appName: '$(FUNC_NAME)'
+          package: '$(Pipeline.Workspace)/function/function.zip'
+          deploymentMethod: 'runFromPackage'
 
 - stage: destroy
   displayName: 'Terraform destroy (guarded)'

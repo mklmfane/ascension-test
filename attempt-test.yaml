@@ -565,6 +565,12 @@ stages:
       - job: destroy_all
         displayName: 'Destroy all'
         pool: { name: 'ubuntuvm' }
+        dependsOn:
+          - infra_${{ e }}
+          - func_local_test_${{ e }}
+          - build_${{ e }}
+          - deploy_${{ e }}
+        condition: and(always(), eq(variables['doDestroy'], 'true'))
         steps:
           - checkout: self
             clean: true

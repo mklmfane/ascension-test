@@ -205,38 +205,54 @@ stages:
 
           - bash: |
               set -euo pipefail
-
-              # Isolate npm global prefix to this job/run
               export NPM_PREFIX="$(Agent.TempDirectory)/npm-global-$(Build.BuildId)"
               mkdir -p "$NPM_PREFIX"
               npm config set prefix "$NPM_PREFIX"
               export PATH="$NPM_PREFIX/bin:$PATH"
               echo "Using NPM_PREFIX=$NPM_PREFIX"
 
-              # Resilient npm network settings
+              # Resilient npm
               export npm_config_fetch_retries=6
               export npm_config_fetch_retry_factor=2
               export npm_config_fetch_retry_maxtimeout=120000
               export npm_config_network_timeout=120000
 
-              # Clean any partial installs in our private prefix (idempotent)
+              # Clean any partials
               rm -rf "$NPM_PREFIX/lib/node_modules/azure-functions-core-tools" \
-                "$NPM_PREFIX/lib/node_modules/.azure-functions-core-tools-"* 2>/dev/null || true
+              "$NPM_PREFIX/lib/node_modules/.azure-functions-core-tools-"* 2>/dev/null || true
 
-              # Install Core Tools v4
               npm i -g azure-functions-core-tools@4 --unsafe-perm=true --loglevel=warn
 
-              # Make sure the binary is executable (some FS/mounts drop +x)
+              # Ensure the binary is runnable
               chmod +x "$NPM_PREFIX/lib/node_modules/azure-functions-core-tools/bin/func" || true
 
-              # Prove it works and share NPM_PREFIX for later steps
               func --version || "$NPM_PREFIX/lib/node_modules/azure-functions-core-tools/bin/func" --version
               echo "##vso[task.setvariable variable=NPM_PREFIX]$NPM_PREFIX"
-            displayName: 'Install Azure Functions Core Tools v4 (user)'
+            displayName: 'Install Azure Functions Core Tools v4 (isolated)'
 
           - bash: |
               set -euo pipefail
-              export PATH="$HOME/.npm-global/bin:$PATH"
+
+              # Use the isolated Core Tools from the install step (fallback if not set)
+              if [ -z "${NPM_PREFIX:-}" ]; then
+                export NPM_PREFIX="$(Agent.TempDirectory)/npm-global-$(Build.BuildId)"
+              fi
+              export PATH="$NPM_PREFIX/bin:$PATH"
+
+              # Resolve func path and fix permissions if needed
+              FUNC_BIN="$(command -v func || true)"
+              if [ -z "$FUNC_BIN" ]; then
+                FUNC_BIN="$NPM_PREFIX/lib/node_modules/azure-functions-core-tools/bin/func"
+              fi
+              chmod +x "$FUNC_BIN" || true
+              # If still not runnable (e.g., noexec mount), copy to an exec path
+              if ! "$FUNC_BIN" --version >/dev/null 2>&1; then
+                cp "$FUNC_BIN" "$(Agent.TempDirectory)/func"
+                chmod +x "$(Agent.TempDirectory)/func"
+                FUNC_BIN="$(Agent.TempDirectory)/func"
+              fi
+              "$FUNC_BIN" --version
+
               cd "$(Build.SourcesDirectory)/api-function"
 
               # venv + deps (quiet, no pip self-upgrade)
@@ -249,19 +265,19 @@ stages:
               export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 
               # settings from repo; normalize worker runtime for local host
-              cp -f local.settings.example.json local.settings.json
+              cp -f local.settings.example.json local.settings.json || true
               sed -E -i 's/("FUNCTIONS_WORKER_RUNTIME":)[[:space:]]*"[^"]+"/\1 "python"/' local.settings.json
 
               # start host
               LOG_FILE="$(Build.SourcesDirectory)/.func.log"
               PID_FILE="$(Build.SourcesDirectory)/.func.pid"
-              nohup func start --python3 --port 7071 --verbose > "$LOG_FILE" 2>&1 & echo $! > "$PID_FILE"
+              nohup "$FUNC_BIN" start --python3 --port 7071 --verbose > "$LOG_FILE" 2>&1 & echo $! > "$PID_FILE"
 
               echo "Waiting for Functions host..."
               ready=0
               for i in {1..90}; do
-                if curl -fsS "http://127.0.0.1:7071/admin/host/status" >/dev/null 2>&1; then ready=1; break; fi
-                if grep -qE 'Host started|Job host started' "$LOG_FILE" 2>/dev/null; then ready=1; break; fi
+                  if curl -fsS "http://127.0.0.1:7071/admin/host/status" >/dev/null 2>&1; then ready=1; break; fi
+                  if grep -qE 'Host started|Job host started' "$LOG_FILE" 2>/dev/null; then ready=1; break; fi
                   sleep 2
               done
 
@@ -272,7 +288,6 @@ stages:
                 pkill -f "func start" || true
                 exit 1
               fi
-
               echo "Smoke test /api/products:"
               curl -v "http://127.0.0.1:7071/api/products" || true
 

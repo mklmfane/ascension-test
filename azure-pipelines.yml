@@ -9,10 +9,9 @@ variables:
   RG_NAME_PREFIX: 'ascension-up'
   location: 'northeurope'
 
-
 stages:
 # =====================================
-# DEV STAGE (build -> infra -> apps)  #
+# DEV STAGE (build -> infra -> apps)
 # =====================================
 - stage: dev
   displayName: 'DEV'
@@ -70,7 +69,6 @@ stages:
 
             # =========================================================
             # Phase 1: Targeted apply to create the Key Vault only
-            # (so we can import existing KV role assignments if they exist)
             # =========================================================
             echo ">>> Phase 1: apply target to create Key Vault"
             terraform -chdir="$TF_DIR" plan -no-color -input=false \
@@ -81,12 +79,12 @@ stages:
 
             terraform -chdir="$TF_DIR" apply -auto-approve -no-color "tfplan.phase1.$(env).out"
 
-            # Key Vault may take a bit to surface in ARM queries; add a short retry loop.
+            # Wait for KV to be queryable
             echo "Waiting for Key Vault to be queryable..."
             for i in {1..10}; do
               KV_ID=$(az keyvault list -g "$RG_NAME" \
                 --query "[?starts_with(name, 'kv-$(env)-ascension-')].id | [0]" -o tsv 2>/dev/null || true)
-             [ -n "$KV_ID" ] && break || sleep 6
+              [ -n "$KV_ID" ] && break || sleep 6
             done
             if [ -z "${KV_ID:-}" ]; then
               echo "ERROR: Key Vault not found in resource group $RG_NAME after creation."; exit 1
@@ -94,13 +92,12 @@ stages:
             echo "KV_ID=$KV_ID"
 
             # =========================================================
-            # Import-if-exists guards for KV role assignments (AFTER KV exists)
+            # Import-if-exists guards for KV role assignments
             # =========================================================
             TF_ADDR_SELF="module.app_service.azurerm_role_assignment.kv_secrets_officer_self"
             TF_ADDR_PIPE="module.app_service.azurerm_role_assignment.kv_secrets_officer_pipeline[0]"
             ROLE_NAME="Key Vault Secrets Officer"
 
-            # Self principal (current context may be SP in pipelines)
             SELF_OBJECT_ID=$(az ad signed-in-user show --query id -o tsv 2>/dev/null || true)
             if [ -z "${SELF_OBJECT_ID:-}" ]; then
               SELF_OBJECT_ID=$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv 2>/dev/null || true)
@@ -120,10 +117,10 @@ stages:
 
             if [ -n "${PIPELINE_PRINCIPAL_OBJECT_ID:-}" ] && [ "${PIPELINE_PRINCIPAL_OBJECT_ID}" != "null" ]; then
               EXIST_PIPE=$(az role assignment list \
-              --assignee-object-id "$PIPELINE_PRINCIPAL_OBJECT_ID" \
-              --scope "$KV_ID" \
-              --role "$ROLE_NAME" \
-              --query "[0].id" -o tsv || true)
+                --assignee-object-id "$PIPELINE_PRINCIPAL_OBJECT_ID" \
+                --scope "$KV_ID" \
+                --role "$ROLE_NAME" \
+                --query "[0].id" -o tsv || true)
               if [ -n "$EXIST_PIPE" ]; then
                 echo "Importing existing KV role assignment (pipeline): $EXIST_PIPE"
                 terraform -chdir="$TF_DIR" import "$TF_ADDR_PIPE" "$EXIST_PIPE" || true
@@ -134,12 +131,12 @@ stages:
             # Phase 2: Full plan/apply
             # =========================================================
             echo ">>> Phase 2: full plan/apply"
-              terraform -chdir="$TF_DIR" plan -no-color -input=false \
-                -var="workflow=$(env)" \
-                -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
-                -var="frontend_image_name=frontend-$(env)" \
-                -var="frontend_image_tag=${BUILD_BUILDID}" \
-                -out="tfplan.$(env).out"
+            terraform -chdir="$TF_DIR" plan -no-color -input=false \
+              -var="workflow=$(env)" \
+              -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
+              -var="frontend_image_name=frontend-$(env)" \
+              -var="frontend_image_tag=${BUILD_BUILDID}" \
+              -out="tfplan.$(env).out"
 
             if [ "$(Build.SourceBranch)" = "refs/heads/main" ]; then
               terraform -chdir="$TF_DIR" apply -auto-approve -no-color "tfplan.$(env).out"
@@ -153,148 +150,136 @@ stages:
         condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
         displayName: 'Publish tf-outputs'
 
-
-      - publish: $(Build.SourcesDirectory)/terraform/tf-outputs.$(env).json
-        artifact: tf-outputs-$(env)
-        condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
-        displayName: 'Publish tf-outputs'
-
-
   # ---- dev_func_local_test ----
   - job: dev_func_local_test
     displayName: 'Azure Function local test (Python 3.11, no heredocs)'
-    pool: { name: 'ubuntuvm' }   # self-hosted
-    steps:
-    - checkout: self
-      clean: true
-
-    # Verify Docker is usable by this agent account (optional but handy)
-    - bash: |
-        set -e
-        echo "whoami: $(whoami)"; id
-        ls -l /var/run/docker.sock || true
-        docker info >/dev/null
-        docker version
-      displayName: 'Verify Docker daemon access (self-hosted)'
-
-    # Resolve interpreter (prefer python3.11)
-    - bash: |
-        set -e
-        if command -v python3 >/dev/null 2>&1; then
-          PY="$(command -v python3)"
-        elif command -v python3 >/dev/null 2>&1; then
-          PY="$(command -v python3)"
-        else
-          echo "No python3 installed on the agent." >&2
-          exit 1
-        fi
-        echo "Using Python: $PY"
-        "$PY" --version
-        echo "##vso[task.setvariable variable=PY]$PY"
-      displayName: 'Resolve Python (prefer 3.11)'
-
-    # Node is needed by Functions Core Tools
-    - task: NodeTool@0
-      inputs:
-        versionSpec: '18.x'
-      displayName: 'Use Node 18.x'
-
-    # Install Azure Functions Core Tools v4 to user prefix (no sudo)
-    - bash: |
-        set -e
-        mkdir -p "$HOME/.npm-global"
-        npm config set prefix "$HOME/.npm-global"
-        export PATH="$HOME/.npm-global/bin:$PATH"
-        # npm fetch retry knobs
-        export npm_config_fetch_retries=6
-        export npm_config_fetch_retry_factor=2
-        export npm_config_fetch_retry_maxtimeout=120000
-        export npm_config_network_timeout=120000
-
-        n=0
-          until [ $n -ge 5 ]; do
-            npm i -g azure-functions-core-tools@4 --unsafe-perm true && break
-            n=$((n+1)); echo "retry $n/5…"; sleep $((5*n))
-          done
-        func --version
-      displayName: 'Install Azure Functions Core Tools v4 (user)'
-
-    - bash: |
-        set -euo pipefail
-        export PATH="$HOME/.npm-global/bin:$PATH"
-        cd "$(Build.SourcesDirectory)/api-function"
-
-        # venv + deps (quiet, no pip self-upgrade)
-        "$PY" -m venv .venv
-        . .venv/bin/activate
-        export PIP_DISABLE_PIP_VERSION_CHECK=1
-        python3 -m pip install -q -r requirements.txt
-
-        # ensure package-style imports (Products/)
-        export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
-
-        # copy and normalize settings without heredocs
-        cp -f local.settings.example.json local.settings.json
-        # force FUNCTIONS_WORKER_RUNTIME to "python" (robust replace)
-        sed -E -i 's/("FUNCTIONS_WORKER_RUNTIME":)[[:space:]]*"[^"]+"/\1 "python"/' local.settings.json
-
-        # start host
-        LOG_FILE="$(Build.SourcesDirectory)/.func.log"
-        PID_FILE="$(Build.SourcesDirectory)/.func.pid"
-        nohup func start --python3 --port 7071 --verbose > "$LOG_FILE" 2>&1 & echo $! > "$PID_FILE"
-
-        echo "Waiting for Functions host..."
-        ready=0
-        for i in {1..90}; do
-          if curl -fsS "http://127.0.0.1:7071/admin/host/status" >/dev/null 2>&1; then ready=1; break; fi
-          if grep -qE 'Host started|Job host started' "$LOG_FILE" 2>/dev/null; then ready=1; break; fi
-          sleep 2
-        done
-
-        if [ "$ready" -ne 1 ]; then
-          echo "ERROR: Host not ready. Last 200 log lines:" >&2
-          tail -n 200 "$LOG_FILE" || true
-          kill "$(cat "$PID_FILE")" 2>/dev/null || true
-          pkill -f "func start" || true
-          exit 1
-        fi
-
-        echo "Smoke test /api/products:"
-        curl -v "http://127.0.0.1:7071/api/products" || true
-
-        echo "Running pytest…"
-        pytest -q
-      displayName: 'Create venv, normalize settings, start func, smoke-test, pytest'
-
-    - bash: |
-        set -euo pipefail
-        PID_FILE="$(Build.SourcesDirectory)/.func.pid"
-        LOG_FILE="$(Build.SourcesDirectory)/.func.log"
-        if [ -f "$PID_FILE" ]; then
-          echo "Stopping Functions host (PID $(cat "$PID_FILE")) ..."
-          kill "$(cat "$PID_FILE")" || true
-          pkill -f "func start" || true
-          sleep 2
-        fi
-        echo "Last 200 lines of Functions host log:"
-        tail -n 200 "$LOG_FILE" || true
-      displayName: 'Stop func & show logs'
-      condition: always()
-
-  # ---- build_dev ----
-  - job: build_dev
-    displayName: 'Build frontend for React with App Service & package function (dev)'
-    dependsOn: 
-      - dev_infra
-      - dev_func_local_test
     pool: { name: 'ubuntuvm' }
     steps:
       - checkout: self
         clean: true
 
-      # ACR login server from Terraform outputs is needed to build & push container
-      - download: current-terraform-state-output
+      - bash: |
+          set -e
+          echo "whoami: $(whoami)"; id
+          ls -l /var/run/docker.sock || true
+          docker info >/dev/null
+          docker version
+        displayName: 'Verify Docker daemon access (self-hosted)'
+
+      - bash: |
+          set -e
+          if command -v python3 >/dev/null 2>&1; then
+            PY="$(command -v python3)"
+          else
+            echo "No python3 installed on the agent." >&2
+            exit 1
+          fi
+          echo "Using Python: $PY"
+          "$PY" --version
+          echo "##vso[task.setvariable variable=PY]$PY"
+        displayName: 'Resolve Python (prefer 3.11)'
+
+      - task: NodeTool@0
+        inputs:
+          versionSpec: '18.x'
+        displayName: 'Use Node 18.x'
+
+      - bash: |
+          set -e
+          mkdir -p "$HOME/.npm-global"
+          npm config set prefix "$HOME/.npm-global"
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> ~/.bashrc
+          # npm retry knobs to survive transient network hiccups
+          export npm_config_fetch_retries=6
+          export npm_config_fetch_retry_factor=2
+          export npm_config_fetch_retry_maxtimeout=120000
+          export npm_config_network_timeout=120000
+          n=0
+          until [ $n -ge 5 ]; do
+            npm i -g azure-functions-core-tools@4 --unsafe-perm true && break
+            n=$((n+1)); echo "retry $n/5…"; sleep $((5*n))
+          done
+          func --version
+        displayName: 'Install Azure Functions Core Tools v4 (user)'
+
+      - bash: |
+          set -euo pipefail
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          cd "$(Build.SourcesDirectory)/api-function"
+
+          # venv + deps (quiet, no pip self-upgrade)
+          "$PY" -m venv .venv
+          . .venv/bin/activate
+          export PIP_DISABLE_PIP_VERSION_CHECK=1
+          python3 -m pip install -q -r requirements.txt
+
+          # Imports for package layout
+          export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
+
+          # settings from repo; normalize worker runtime for local host
+          cp -f local.settings.example.json local.settings.json
+          sed -E -i 's/("FUNCTIONS_WORKER_RUNTIME":)[[:space:]]*"[^"]+"/\1 "python"/' local.settings.json
+
+          # start host
+          LOG_FILE="$(Build.SourcesDirectory)/.func.log"
+          PID_FILE="$(Build.SourcesDirectory)/.func.pid"
+          nohup func start --python3 --port 7071 --verbose > "$LOG_FILE" 2>&1 & echo $! > "$PID_FILE"
+
+          echo "Waiting for Functions host..."
+          ready=0
+          for i in {1..90}; do
+            if curl -fsS "http://127.0.0.1:7071/admin/host/status" >/dev/null 2>&1; then ready=1; break; fi
+            if grep -qE 'Host started|Job host started' "$LOG_FILE" 2>/dev/null; then ready=1; break; fi
+            sleep 2
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            echo "ERROR: Host not ready. Last 200 log lines:" >&2
+            tail -n 200 "$LOG_FILE" || true
+            kill "$(cat "$PID_FILE")" 2>/dev/null || true
+            pkill -f "func start" || true
+            exit 1
+          fi
+
+          echo "Smoke test /api/products:"
+          curl -v "http://127.0.0.1:7071/api/products" || true
+
+          echo "Running pytest…"
+          pytest -q
+        displayName: 'Create venv, normalize settings, start func, smoke-test, pytest'
+
+      - bash: |
+          set -euo pipefail
+          PID_FILE="$(Build.SourcesDirectory)/.func.pid"
+          LOG_FILE="$(Build.SourcesDirectory)/.func.log"
+          if [ -f "$PID_FILE" ]; then
+            echo "Stopping Functions host (PID $(cat "$PID_FILE")) ..."
+            kill "$(cat "$PID_FILE")" || true
+            pkill -f "func start" || true
+            sleep 2
+          fi
+          echo "Last 200 lines of Functions host log:"
+          tail -n 200 "$LOG_FILE" || true
+        displayName: 'Stop func & show logs'
+        condition: always()
+
+  # ---- build_dev ----
+  - job: build_dev
+    displayName: 'Build frontend for React with App Service & package function (dev)'
+    dependsOn:
+      - dev_infra
+      - dev_func_local_test
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    pool: { name: 'ubuntuvm' }
+    steps:
+      - checkout: self
+        clean: true
+
+      # Download TF outputs produced by dev_infra (main only)
+      - download: current
         artifact: tf-outputs-$(env)
+        displayName: 'Download tf outputs'
 
       - task: AzureCLI@2
         displayName: 'Login + Build & Push Frontend Container to ACR'
@@ -308,22 +293,19 @@ stages:
             TF_OUT="$(Pipeline.Workspace)/tf-outputs-$(env)/tf-outputs.$(env).json"
             test -f "$TF_OUT" || { echo "Missing TF outputs at $TF_OUT"; exit 1; }
 
-            ACR_LOGIN_SERVER=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['acr_login_server']['value'])")
+            ACR_LOGIN_SERVER=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['acr_login_server']['value'])" "$TF_OUT")
             test -n "$ACR_LOGIN_SERVER" || { echo "acr_login_server missing in TF outputs"; exit 1; }
             ACR_NAME="${ACR_LOGIN_SERVER%%.*}"
 
             echo "Using ACR: $ACR_NAME ($ACR_LOGIN_SERVER)"
 
-            # Ensure Docker is available on your self-hosted agent
             if ! command -v docker >/dev/null 2>&1; then
               echo "Docker not found on agent. Please install & start Docker on 'ubuntuvm'." >&2
               exit 1
             fi
 
-            # Log in to ACR (OIDC-backed service connection is already logged in to Azure)
             az acr login -n "$ACR_NAME"
 
-            # Build from your existing repo structure: frontend/ (expects Dockerfile + nginx.conf there)
             FRONTEND_DIR="$(Build.SourcesDirectory)/frontend"
             test -f "$FRONTEND_DIR/Dockerfile" || { echo "frontend/Dockerfile not found"; exit 1; }
             test -f "$FRONTEND_DIR/nginx.conf" || { echo "frontend/nginx.conf not found"; exit 1; }
@@ -336,7 +318,6 @@ stages:
             docker build -t "$IMAGE_URI" "$FRONTEND_DIR"
             docker push "$IMAGE_URI"
 
-            # Save image metadata for deploy job
             META_DIR="$(Build.ArtifactStagingDirectory)/frontend-image"
             mkdir -p "$META_DIR"
             cat > "$META_DIR/image.json" <<EOF
@@ -344,51 +325,47 @@ stages:
                 "acr_login_server": "$ACR_LOGIN_SERVER",
                 "image_name": "$IMG_NAME",
                 "image_tag": "$IMG_TAG",
-              "image_uri": "$IMAGE_URI"
+                "image_uri": "$IMAGE_URI"
             }
             EOF
 
       - publish: $(Build.ArtifactStagingDirectory)/frontend-image
         artifact: frontend-image
 
-      # Package Python Azure Function (zip) from your repo (api-function/)
+      # Package Python Azure Function (zip) from api-function/
       - bash: |
           set -euo pipefail
           FUNC_SRC="$(Build.SourcesDirectory)/api-function"
           OUT_DIR="$(Build.ArtifactStagingDirectory)/function"
           mkdir -p "$OUT_DIR"
 
-          # Ensure expected files exist
           test -f "$FUNC_SRC/host.json" || { echo "api-function/host.json missing"; exit 1; }
 
-          # vendor deps into .python_packages so they are part of the zip
           python3 -m pip install --upgrade pip
           python3 -m pip install -r "$FUNC_SRC/requirements.txt" --target "$FUNC_SRC/.python_packages/lib/site-packages"
 
-          # Zip (exclude venv/.git/__pycache__)
           cd "$FUNC_SRC"
           zip -r "$OUT_DIR/function.zip" . \
             -x ".*" -x "__pycache__/*" -x ".venv/*" -x "venv/*" >/dev/null
           echo "Created $OUT_DIR/function.zip"
         displayName: 'Package Python Azure Function (zip)'
 
-      - publish: $(Build.ArtifactStagingDirectory)/azure-function-python
-        artifact: azure-function-python
-
+      # Publish the folder that contains function.zip, name the artifact "function"
+      - publish: $(Build.ArtifactStagingDirectory)/function
+        artifact: function
 
   # ---- dev_apps ----
   - job: deploy_apps
     displayName: 'Deploy apps (dev)'
-    dependsOn:
-      - build_dev
+    dependsOn: [ build_dev ]
     condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
     pool: { name: 'ubuntuvm' }
     steps:
-      - download: current-frontend-image
+      - download: current
         artifact: frontend-image
-      - download: current-azure-function-python
+      - download: current
         artifact: function
-      - download: current-terraform-state-output
+      - download: current
         artifact: tf-outputs-$(env)
 
       - task: AzureCLI@2
@@ -402,26 +379,27 @@ stages:
 
             TF_OUT="$(Pipeline.Workspace)/tf-outputs-$(env)/tf-outputs.$(env).json"
             IMG_META="$(Pipeline.Workspace)/frontend-image/image.json"
+            FN_ZIP="$(Pipeline.Workspace)/function/function.zip"
+
             test -f "$TF_OUT"   || { echo "Missing TF outputs $TF_OUT"; exit 1; }
             test -f "$IMG_META" || { echo "Missing image metadata $IMG_META"; exit 1; }
+            test -f "$FN_ZIP"   || { echo "Function zip not found at $FN_ZIP"; exit 1; }
 
-            RG=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['resource_group_name']['value'])")
-            WEB=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['react_web_name']['value'])")
-            FN=$(python3 -c "import json;print(json.load(open('$TF_OUT'))['function_name']['value'])")
-            ACR_LOGIN_SERVER=$(python3 -c "import json;print(json.load(open('$IMG_META'))['acr_login_server'])")
-            IMAGE_URI=$(python3 -c "import json;print(json.load(open('$IMG_META'))['image_uri'])")
+            RG=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['resource_group_name']['value'])" "$TF_OUT")
+            WEB=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['react_web_name']['value'])" "$TF_OUT")
+            FN=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['function_name']['value'])" "$TF_OUT")
+            ACR_LOGIN_SERVER=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['acr_login_server'])" "$IMG_META")
+            IMAGE_URI=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['image_uri'])" "$IMG_META")
 
             echo "RG=$RG WEB=$WEB FN=$FN"
             echo "IMAGE_URI=$IMAGE_URI"
 
-            # Ensure target Web App is Linux
             KIND=$(az webapp show -g "$RG" -n "$WEB" --query "kind" -o tsv)
             RESERVED=$(az webapp show -g "$RG" -n "$WEB" --query "reserved" -o tsv)
             if [[ "${RESERVED}" != "true" && "${KIND}" != *"linux"* ]]; then
               echo "ERROR: Web App '$WEB' is not Linux."; exit 1
             fi
 
-            # Configure Web App to use ACR image (managed identity pull)
             az webapp config container set \
               -g "$RG" -n "$WEB" \
               --docker-custom-image-name "$IMAGE_URI" \
@@ -433,20 +411,14 @@ stages:
               WEBSITES_PORT=80
             az webapp restart -g "$RG" -n "$WEB"
 
-            # Deploy Function zip
-            FUNCTION_ZIP="$(Pipeline.Workspace)/function/function.zip"
-            test -f "$FUNCTION_ZIP" || { echo "Function zip not found at $FUNCTION_ZIP"; exit 1; }
             az functionapp config appsettings set -g "$RG" -n "$FN" --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true
-            az functionapp deployment source config-zip -g "$RG" -n "$FN" --src "$FUNCTION_ZIP"
+            az functionapp deployment source config-zip -g "$RG" -n "$FN" --src "$FN_ZIP"
 
-            # Best-effort smoke check
             curl -fsS "https://${FN}.azurewebsites.net/api/products" || true
 
-
-# ===== Optional destroy (linear after prod) =====
+# ===== Optional destroy (linear after dev) =====
 - stage: destroy
   displayName: 'Terraform destroy (guarded)'
-  #dependsOn: prod
   dependsOn: dev
   condition: and(succeeded(), eq(variables['doDestroy'], 'true'))
   jobs:
@@ -454,9 +426,7 @@ stages:
     pool: { name: 'ubuntuvm' }
     strategy:
       matrix:
-        dev:  { env: dev }
-        #test: { env: test }
-        #prod: { env: prod }
+        dev: { env: dev }
     steps:
       - checkout: self
         clean: true

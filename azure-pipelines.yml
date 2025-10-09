@@ -185,22 +185,34 @@ stages:
         displayName: 'Use Node 18.x'
 
       - bash: |
-          set -e
-          mkdir -p "$HOME/.npm-global"
-          npm config set prefix "$HOME/.npm-global"
-          export PATH="$HOME/.npm-global/bin:$PATH"
-          echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> ~/.bashrc
-          # npm retry knobs to survive transient network hiccups
+          set -euo pipefail
+
+          # Isolate npm global prefix to this job/run
+          export NPM_PREFIX="$(Agent.TempDirectory)/npm-global-$(Build.BuildId)"
+          mkdir -p "$NPM_PREFIX"
+          npm config set prefix "$NPM_PREFIX"
+          export PATH="$NPM_PREFIX/bin:$PATH"
+          echo "Using NPM_PREFIX=$NPM_PREFIX"
+
+          # Resilient npm network settings
           export npm_config_fetch_retries=6
           export npm_config_fetch_retry_factor=2
           export npm_config_fetch_retry_maxtimeout=120000
           export npm_config_network_timeout=120000
-          n=0
-          until [ $n -ge 5 ]; do
-            npm i -g azure-functions-core-tools@4 --unsafe-perm true && break
-            n=$((n+1)); echo "retry $n/5…"; sleep $((5*n))
-          done
-          func --version
+
+          # Clean any partial installs in our private prefix (idempotent)
+          rm -rf "$NPM_PREFIX/lib/node_modules/azure-functions-core-tools" \
+          "$NPM_PREFIX/lib/node_modules/.azure-functions-core-tools-"* 2>/dev/null || true
+
+          # Install Core Tools v4
+          npm i -g azure-functions-core-tools@4 --unsafe-perm=true --loglevel=warn
+
+          # Make sure the binary is executable (some FS/mounts drop +x)
+          chmod +x "$NPM_PREFIX/lib/node_modules/azure-functions-core-tools/bin/func" || true
+
+          # Prove it works and share NPM_PREFIX for later steps
+          func --version || "$NPM_PREFIX/lib/node_modules/azure-functions-core-tools/bin/func" --version
+          echo "##vso[task.setvariable variable=NPM_PREFIX]$NPM_PREFIX"
         displayName: 'Install Azure Functions Core Tools v4 (user)'
 
       - bash: |

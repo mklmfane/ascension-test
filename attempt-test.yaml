@@ -563,40 +563,33 @@ stages:
 # ===========================
 # DESTROY stage (single stage)
 # ===========================
-- stage: destroy
-  displayName: 'Terraform destroy (guarded)'
-  dependsOn:
-    - dev
-    - test
-  condition: and(succeeded(), eq(variables['doDestroy'], 'true'))
-  jobs:
-  - job: destroy_all
-    displayName: 'Destroy all'
-    pool: { name: 'ubuntuvm' }
-    strategy:
-      matrix:
-        dev:  { env: dev }
-        test: { env: test }
-    steps:
-      - checkout: self
-        clean: true
-      - task: AzureCLI@2
-        displayName: "Destroy $(env)"
-        inputs:
-          azureSubscription: '$(serviceConnection)'
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -euo pipefail
-            TF_DIR="$(Build.SourcesDirectory)/terraform"
-            terraform -chdir="$TF_DIR" init -input=false
-            if terraform -chdir="$TF_DIR" workspace list | sed 's/*//;s/ //g' | grep -Fxq "$(env)"; then
-              terraform -chdir="$TF_DIR" workspace select "$(env)"
-              if terraform -chdir="$TF_DIR" state list >/dev/null 2>&1; then
-                terraform -chdir="$TF_DIR" destroy -no-color -auto-approve -var="workflow=$(env)"
-              else
-                echo "No state for $(env); skipping destroy."
-              fi
-            else
-              echo "Workspace $(env) not found; skipping destroy."
-            fi
+      - job: destroy_all
+        displayName: 'Destroy all'
+        pool: { name: 'ubuntuvm' }
+        strategy:
+          matrix:
+            dev:  { env: dev }
+            test: { env: test }
+        steps:
+          - checkout: self
+            clean: true
+          - task: AzureCLI@2
+            displayName: "Destroy $(env)"
+            inputs:
+              azureSubscription: '$(serviceConnection)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                TF_DIR="$(Build.SourcesDirectory)/terraform"
+                terraform -chdir="$TF_DIR" init -input=false
+                if terraform -chdir="$TF_DIR" workspace list | sed 's/*//;s/ //g' | grep -Fxq "$(env)"; then
+                    terraform -chdir="$TF_DIR" workspace select "$(env)"
+                if terraform -chdir="$TF_DIR" state list >/dev/null 2>&1; then
+                  terraform -chdir="$TF_DIR" destroy -no-color -auto-approve -var="workflow=$(env)"
+                else
+                  echo "No state for $(env); skipping destroy."
+                fi
+                else
+                  echo "Workspace $(env) not found; skipping destroy."
+                fi

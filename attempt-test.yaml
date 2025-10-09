@@ -1,0 +1,480 @@
+trigger: none
+
+# ------------------------------------------------------
+# List the environments you want to generate stages for
+# ------------------------------------------------------
+parameters:
+  - name: envs
+    type: object
+    default:
+      - dev
+      - test
+
+# Global vars
+variables:
+  serviceConnection: 'terraform-access'
+  GO_VERSION: '1.24.5'
+  TFSEC_VERSION: 'v1.28.14'
+  TFLINT_VERSION: 'v0.59.1'
+  doDestroy: 'true'
+  RG_NAME_PREFIX: 'ascension-up'
+  location: 'northeurope'
+
+# ======================================================
+#   STAGES (generated once per env from the list above)
+# ======================================================
+# DEV has no dependsOn; TEST depends on DEV.
+# Each stage contains the 4 jobs you already run:
+#   infra -> func_local_test -> build -> deploy (deployment job w/ approvals)
+# ======================================================
+${{ each e in parameters.envs }}:
+- stage: ${{ e }}
+  displayName: '${{ upper(e) }}'
+  ${{ if eq(e, 'test') }}:
+    dependsOn: dev
+    condition: succeeded()
+  variables:
+    env: ${{ e }}
+  jobs:
+
+  # -----------------------------
+  # 1) Infra (Terraform apply)
+  # -----------------------------
+  - job: infra_${{ e }}
+    displayName: 'Provision infra (${{ e }})'
+    pool: { name: 'ubuntuvm' }
+    steps:
+      - checkout: self
+        clean: true
+
+      - task: AzureCLI@2
+        displayName: 'Login + tools + plan/apply (${{ e }})'
+        inputs:
+          azureSubscription: '$(serviceConnection)'
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
+            az account show
+
+            TF_DIR="$(Build.SourcesDirectory)/terraform"
+
+            # --- Optional lint ---
+            BIN_DIR="$(Agent.TempDirectory)/bin"; mkdir -p "$BIN_DIR"; export PATH="$BIN_DIR:$PATH"
+            tflint --init && tflint --recursive || true
+            tfsec "$TF_DIR" || true
+
+            # --- Init + workspace (create only if missing) ---
+            terraform -chdir="$TF_DIR" init -input=false
+            ensure_ws() {
+              local dir="$1" ws="$2"
+              if terraform -chdir="$dir" workspace list | sed 's/*//;s/ //g' | grep -Fxq "$ws"; then
+                terraform -chdir="$dir" workspace select "$ws"
+              else
+                terraform -chdir="$dir" workspace new "$ws"
+              fi
+            }
+            ensure_ws "$TF_DIR" "$(env)"
+
+            # --- Import-if-exists guard for Resource Group (idempotent) ---
+            SUB_ID=$(az account show --query id -o tsv)
+            RG_NAME="$(RG_NAME_PREFIX)-$(env)-rg"
+            if az group exists -n "$RG_NAME"; then
+              if ! terraform -chdir="$TF_DIR" state show azurerm_resource_group.ascension_test_rg >/dev/null 2>&1; then
+                terraform -chdir="$TF_DIR" import azurerm_resource_group.ascension_test_rg "/subscriptions/$SUB_ID/resourceGroups/$RG_NAME" || true
+              fi
+            fi
+
+            # --- Resolve pipeline principal object id you pass to TF ---
+            SC_CLIENT_ID="331a5bcb-b95d-4529-a528-c858e28d9a89"
+            PIPELINE_PRINCIPAL_OBJECT_ID=$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)
+
+            # Phase 1: Key Vault target apply
+            terraform -chdir="$TF_DIR" plan -no-color -input=false \
+              -target=module.app_service.azurerm_key_vault.kv \
+              -var="workflow=$(env)" \
+              -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
+              -out="tfplan.phase1.$(env).out"
+
+            terraform -chdir="$TF_DIR" apply -auto-approve -no-color "tfplan.phase1.$(env).out"
+
+            # Wait for KV to be queryable
+            RG_NAME="$(RG_NAME_PREFIX)-$(env)-rg"
+            echo "Waiting for Key Vault to be queryable in $RG_NAME..."
+            for i in {1..10}; do
+              KV_ID=$(az keyvault list -g "$RG_NAME" \
+                --query "[?starts_with(name, 'kv-$(env)-ascension-')].id | [0]" -o tsv 2>/dev/null || true)
+              [ -n "$KV_ID" ] && break || sleep 6
+            done
+            [ -n "${KV_ID:-}" ] || { echo "Key Vault not found in $RG_NAME"; exit 1; }
+
+            # Optional: import existing KV role assignments (best effort)
+            TF_ADDR_SELF="module.app_service.azurerm_role_assignment.kv_secrets_officer_self"
+            TF_ADDR_PIPE="module.app_service.azurerm_role_assignment.kv_secrets_officer_pipeline[0]"
+            ROLE_NAME="Key Vault Secrets Officer"
+
+            SELF_OBJECT_ID=$(az ad signed-in-user show --query id -o tsv 2>/dev/null || true)
+            if [ -z "${SELF_OBJECT_ID:-}" ]; then
+              SELF_OBJECT_ID=$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv 2>/dev/null || true)
+            fi
+            if [ -n "${SELF_OBJECT_ID:-}" ]; then
+              EXIST_SELF=$(az role assignment list --assignee-object-id "$SELF_OBJECT_ID" --scope "$KV_ID" --role "$ROLE_NAME" --query "[0].id" -o tsv || true)
+              [ -n "$EXIST_SELF" ] && terraform -chdir="$TF_DIR" import "$TF_ADDR_SELF" "$EXIST_SELF" || true
+            fi
+            if [ -n "${PIPELINE_PRINCIPAL_OBJECT_ID:-}" ] && [ "${PIPELINE_PRINCIPAL_OBJECT_ID}" != "null" ]; then
+              EXIST_PIPE=$(az role assignment list --assignee-object-id "$PIPELINE_PRINCIPAL_OBJECT_ID" --scope "$KV_ID" --role "$ROLE_NAME" --query "[0].id" -o tsv || true)
+              [ -n "$EXIST_PIPE" ] && terraform -chdir="$TF_DIR" import "$TF_ADDR_PIPE" "$EXIST_PIPE" || true
+            fi
+
+            # Phase 2: Full plan/apply
+            terraform -chdir="$TF_DIR" plan -no-color -input=false \
+              -var="workflow=$(env)" \
+              -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
+              -var="frontend_image_name=frontend-$(env)" \
+              -var="frontend_image_tag=${BUILD_BUILDID}" \
+              -out="tfplan.$(env).out"
+
+            if [ "$(Build.SourceBranch)" = "refs/heads/main" ]; then
+              terraform -chdir="$TF_DIR" apply -auto-approve -no-color "tfplan.$(env).out"
+              terraform -chdir="$TF_DIR" output -json > "$TF_DIR/tf-outputs.$(env).json"
+            else
+              echo "Not main branch, skipping apply."
+            fi
+
+      - publish: $(Build.SourcesDirectory)/terraform/tf-outputs.$(env).json
+        artifact: tf-outputs-$(env)
+        condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+        displayName: 'Publish tf-outputs ($(env))'
+
+  # --------------------------------
+  # 2) Local function smoke + tests
+  # --------------------------------
+  - job: func_local_test_${{ e }}
+    displayName: 'Azure Function local test (${{ e }})'
+    pool: { name: 'ubuntuvm' }
+    steps:
+      - checkout: self
+        clean: true
+
+      - bash: |
+          set -e
+          echo "whoami: $(whoami)"; id
+          ls -l /var/run/docker.sock || true
+          docker info >/dev/null
+          docker version
+        displayName: 'Verify Docker daemon access'
+
+      - bash: |
+          set -e
+          if command -v python3 >/dev/null 2>&1; then
+            PY="$(command -v python3)"
+          else
+            echo "No python3 installed on the agent." >&2
+            exit 1
+          fi
+          echo "Using Python: $PY"
+          "$PY" --version
+          echo "##vso[task.setvariable variable=PY]$PY"
+        displayName: 'Resolve Python (prefer 3.11)'
+
+      - task: NodeTool@0
+        inputs:
+          versionSpec: '18.x'
+        displayName: 'Use Node 18.x'
+
+      - bash: |
+          set -e
+          mkdir -p "$HOME/.npm-global"
+          npm config set prefix "$HOME/.npm-global"
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> ~/.bashrc
+          export npm_config_fetch_retries=6
+          export npm_config_fetch_retry_factor=2
+          export npm_config_fetch_retry_maxtimeout=120000
+          export npm_config_network_timeout=120000
+          n=0
+          until [ $n -ge 5 ]; do
+            npm i -g azure-functions-core-tools@4 --unsafe-perm true && break
+            n=$((n+1)); echo "retry $n/5…"; sleep $((5*n))
+          done
+          func --version
+        displayName: 'Install Azure Functions Core Tools v4'
+
+      - bash: |
+          set -euo pipefail
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          cd "$(Build.SourcesDirectory)/api-function"
+
+          "$PY" -m venv .venv
+          . .venv/bin/activate
+          export PIP_DISABLE_PIP_VERSION_CHECK=1
+          python3 -m pip install -q -r requirements.txt
+
+          export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
+
+          cp -f local.settings.example.json local.settings.json
+          sed -E -i 's/("FUNCTIONS_WORKER_RUNTIME":)[[:space:]]*"[^"]+"/\1 "python"/' local.settings.json
+
+          LOG_FILE="$(Build.SourcesDirectory)/.func.log"
+          PID_FILE="$(Build.SourcesDirectory)/.func.pid"
+          nohup func start --python3 --port 7071 --verbose > "$LOG_FILE" 2>&1 & echo $! > "$PID_FILE"
+
+          echo "Waiting for Functions host..."
+          ready=0
+          for i in {1..90}; do
+            if curl -fsS "http://127.0.0.1:7071/admin/host/status" >/dev/null 2>&1; then ready=1; break; fi
+            if grep -qE 'Host started|Job host started' "$LOG_FILE" 2>/dev/null; then ready=1; break; fi
+            sleep 2
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            echo "ERROR: Host not ready. Last 200 log lines:" >&2
+            tail -n 200 "$LOG_FILE" || true
+            kill "$(cat "$PID_FILE")" 2>/dev/null || true
+            pkill -f "func start" || true
+            exit 1
+          fi
+
+          echo "Smoke test /api/products (best-effort):"
+          curl -v "http://127.0.0.1:7071/api/products" || true
+
+          echo "Running pytest…"
+          pytest -q
+        displayName: 'Create venv, start func, smoke-test, pytest'
+
+      - bash: |
+          set -euo pipefail
+          PID_FILE="$(Build.SourcesDirectory)/.func.pid"
+          LOG_FILE="$(Build.SourcesDirectory)/.func.log"
+          if [ -f "$PID_FILE" ]; then
+            echo "Stopping Functions host (PID $(cat "$PID_FILE")) ..."
+            kill "$(cat "$PID_FILE")" || true
+            pkill -f "func start" || true
+            sleep 2
+          fi
+          echo "Last 200 lines of Functions host log:"
+          tail -n 200 "$LOG_FILE" || true
+        displayName: 'Stop func & show logs'
+        condition: always()
+
+  # --------------------------------
+  # 3) Build (image + function zip)
+  # --------------------------------
+  - job: build_${{ e }}
+    displayName: 'Build frontend & package function (${{ e }})'
+    dependsOn:
+      - infra_${{ e }}
+      - func_local_test_${{ e }}
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    pool: { name: 'ubuntuvm' }
+    steps:
+      - checkout: self
+        clean: true
+
+      - download: current
+        artifact: tf-outputs-$(env)
+
+      - task: AzureCLI@2
+        displayName: 'Login + Build & Push Frontend Container to ACR'
+        inputs:
+          azureSubscription: '$(serviceConnection)'
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
+
+            TF_OUT="$(Pipeline.Workspace)/tf-outputs-$(env)/tf-outputs.$(env).json"
+            RG_NAME="${RG_NAME_PREFIX}-$(env)-rg"
+
+            ACR_LOGIN_SERVER=""
+            if [ -s "$TF_OUT" ]; then
+              ACR_LOGIN_SERVER="$(grep -oP '"acr_login_server"\s*:\s*\{[^}]*\}' "$TF_OUT" 2>/dev/null | grep -oP '"value"\s*:\s*"\K[^"]+' 2>/dev/null || true)"
+              if [ -z "$ACR_LOGIN_SERVER" ]; then
+                ACR_NAME_FROM_OUT="$(grep -oP '"acr_name"\s*:\s*\{[^}]*\}' "$TF_OUT" 2>/dev/null | grep -oP '"value"\s*:\s*"\K[^"]+' 2>/dev/null || true)"
+                [ -n "$ACR_NAME_FROM_OUT" ] && ACR_LOGIN_SERVER="$(az acr show -g "$RG_NAME" -n "$ACR_NAME_FROM_OUT" --query loginServer -o tsv 2>/dev/null || true)"
+              fi
+            fi
+            if [ -z "${ACR_LOGIN_SERVER}" ]; then
+              mapfile -t SERVERS < <(az acr list -g "$RG_NAME" --query "[].loginServer" -o tsv)
+              [ "${#SERVERS[@]}" -gt 0 ] || { echo "No ACR in RG '${RG_NAME}'"; exit 1; }
+              ACR_LOGIN_SERVER="${SERVERS[0]}"
+            fi
+
+            test -n "${ACR_LOGIN_SERVER}" || { echo "Could not resolve ACR login server"; exit 1; }
+            ACR_NAME="${ACR_LOGIN_SERVER%%.*}"
+            echo "Using ACR: ${ACR_NAME} (${ACR_LOGIN_SERVER})"
+
+            command -v docker >/dev/null 2>&1 || { echo "Docker not found on agent."; exit 1; }
+            az acr login -n "${ACR_NAME}"
+
+            FRONTEND_DIR="$(Build.SourcesDirectory)/react-frontend-image"
+            test -f "$FRONTEND_DIR/Dockerfile" || { echo "frontend/Dockerfile not found"; exit 1; }
+            test -f "$FRONTEND_DIR/nginx.conf" || { echo "frontend/nginx.conf not found"; exit 1; }
+
+            IMG_NAME="frontend-$(env)"
+            IMG_TAG="$(Build.BuildId)"
+            IMAGE_URI="${ACR_LOGIN_SERVER}/${IMG_NAME}:${IMG_TAG}"
+
+            echo "Building ${IMAGE_URI} from ${FRONTEND_DIR}"
+            docker build -t "${IMAGE_URI}" "${FRONTEND_DIR}"
+            docker push "${IMAGE_URI}"
+
+            META_DIR="$(Build.ArtifactStagingDirectory)/react-frontend-image"
+            mkdir -p "$META_DIR"
+            cat > "$META_DIR/image.json" <<EOF
+            {
+              "acr_login_server": "${ACR_LOGIN_SERVER}",
+              "image_name": "${IMG_NAME}",
+              "image_tag": "${IMG_TAG}",
+              "image_uri": "${IMAGE_URI}"
+            }
+            EOF
+
+      - publish: $(Build.ArtifactStagingDirectory)/react-frontend-image
+        artifact: react-frontend-image
+
+      - bash: |
+          set -euo pipefail
+          FUNC_SRC="$(Build.SourcesDirectory)/api-function"
+          OUT_DIR="$(Build.ArtifactStagingDirectory)/function"
+          mkdir -p "$OUT_DIR"
+          test -f "$FUNC_SRC/host.json" || { echo "api-function/host.json missing"; exit 1; }
+
+          VENV_DIR="$(Agent.TempDirectory)/func-venv"
+          python3 -m venv "$VENV_DIR"
+          . "$VENV_DIR/bin/activate"
+          export PIP_DISABLE_PIP_VERSION_CHECK=1
+          export PIP_NO_PYTHON_VERSION_WARNING=1
+
+          TARGET_DIR="$FUNC_SRC/.python_packages/lib/site-packages"
+          mkdir -p "$TARGET_DIR"
+          python3 -m pip install --upgrade pip wheel >/dev/null
+          python3 -m pip install -r "$FUNC_SRC/requirements.txt" --target "$TARGET_DIR"
+
+          find "$FUNC_SRC" -type f -name '*.pyc' -delete || true
+          find "$FUNC_SRC" -type d -name '__pycache__' -prune -exec rm -rf {} + || true
+
+          cd "$FUNC_SRC"
+          zip -r "$OUT_DIR/function.zip" . \
+            -x ".git/*" -x ".venv/*" -x "venv/*" -x "$(basename "$VENV_DIR")/*" \
+            -x "__pycache__/*" >/dev/null
+
+          echo "Created $OUT_DIR/function.zip"
+        displayName: 'Build zip with python source for Azure Function'
+
+      - publish: $(Build.ArtifactStagingDirectory)/function
+        artifact: function
+
+  # --------------------------------
+  # 4) Deploy (uses Environment)
+  # --------------------------------
+  - deployment: deploy_${{ e }}
+    displayName: 'Deploy apps (${{ e }})'
+    dependsOn: build_${{ e }}
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    environment: '${{ e }}'   # add approvals on Environment 'test'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - download: current
+              artifact: react-frontend-image
+            - download: current
+              artifact: function
+            - download: current
+              artifact: tf-outputs-$(env)
+
+            - task: AzureCLI@2
+              displayName: 'Resolve RG / app names from TF outputs or Azure'
+              inputs:
+                azureSubscription: '$(serviceConnection)'
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  set -euo pipefail
+                  TF_OUT="$(Pipeline.Workspace)/tf-outputs-$(env)/tf-outputs.$(env).json"
+                  if [ -s "$TF_OUT" ] && command -v jq >/dev/null 2>&1; then
+                    RG="$(jq -r '.resource_group_name.value // .resource_group_name // empty' "$TF_OUT")"
+                  fi
+                  RG="${RG:-$(echo "$(RG_NAME_PREFIX)-$(env)-rg")}"
+
+                  if [ -s "$TF_OUT" ] && command -v jq >/dev/null 2>&1; then
+                    WEB_NAME="$(jq -r '.react_web_name.value // .react_web_name // empty' "$TF_OUT")"
+                    FUNC_NAME="$(jq -r '.function_name.value // .function_name // empty' "$TF_OUT")"
+                  fi
+                  if [ -z "${WEB_NAME:-}" ]; then
+                    WEB_NAME="$(az webapp list -g "$RG" --query "[?contains(kind, 'linux')].name | [0]" -o tsv || true)"
+                  fi
+                  if [ -z "${FUNC_NAME:-}" ]; then
+                    FUNC_NAME="$(az functionapp list -g "$RG" --query "[?contains(kind, 'functionapp,linux')].name | [0]" -o tsv || true)"
+                    [ -n "$FUNC_NAME" ] || FUNC_NAME="$(az functionapp list -g "$RG" --query "[0].name" -o tsv || true)"
+                  fi
+                  [ -n "${WEB_NAME:-}" ]  || { echo "No Linux Web App in RG '$RG'."; exit 2; }
+                  [ -n "${FUNC_NAME:-}" ] || { echo "No Function App in RG '$RG'."; exit 3; }
+                  echo "##vso[task.setvariable variable=RG]$RG"
+                  echo "##vso[task.setvariable variable=WEB_NAME]$WEB_NAME"
+                  echo "##vso[task.setvariable variable=FUNC_NAME]$FUNC_NAME"
+
+            - bash: |
+                set -euo pipefail
+                META="$(Pipeline.Workspace)/react-frontend-image/image.json"
+                [ -s "$META" ] || { echo "image.json not found at $META"; exit 1; }
+                if command -v jq >/dev/null 2>&1; then
+                  IMAGE_URI="$(jq -r '.image_uri // empty' "$META")"
+                else
+                  IMAGE_URI="$(grep -oP '"image_uri"\s*:\s*"\K[^"]+' "$META" || true)"
+                fi
+                [ -n "${IMAGE_URI:-}" ] || { echo "image_uri missing in $META"; exit 1; }
+                echo "##vso[task.setvariable variable=IMAGE_URI]$IMAGE_URI"
+              displayName: 'Read container image URI'
+
+            - task: AzureWebAppContainer@1
+              displayName: 'Point Web App to ACR image'
+              inputs:
+                azureSubscription: '$(serviceConnection)'
+                appName: '$(WEB_NAME)'
+                containers: '$(IMAGE_URI)'
+
+            - task: AzureFunctionApp@2
+              displayName: 'Deploy Python Function (run-from-package)'
+              inputs:
+                connectedServiceNameARM: '$(serviceConnection)'
+                appType: 'functionAppLinux'
+                appName: '$(FUNC_NAME)'
+                package: '$(Pipeline.Workspace)/function/function.zip'
+                deploymentMethod: 'runFromPackage'
+
+# ==========================================
+# DESTROY (one stage, matrix per environment)
+# ==========================================
+  - job: destroy_all
+    displayName: 'Destroy all'
+    pool: { name: 'ubuntuvm' }
+    strategy:
+      matrix:
+        dev:  { env: dev }
+        test: { env: test }
+    steps:
+      - checkout: self
+        clean: true
+      - task: AzureCLI@2
+        displayName: "Destroy $(env)"
+        inputs:
+          azureSubscription: '$(serviceConnection)'
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
+            TF_DIR="$(Build.SourcesDirectory)/terraform"
+            terraform -chdir="$TF_DIR" init -input=false
+            # Only destroy if the workspace and state exist
+            if terraform -chdir="$TF_DIR" workspace list | sed 's/*//;s/ //g' | grep -Fxq "$(env)"; then
+              terraform -chdir="$TF_DIR" workspace select "$(env)"
+              if terraform -chdir="$TF_DIR" state list >/dev/null 2>&1; then
+                terraform -chdir="$TF_DIR" destroy -no-color -auto-approve -var="workflow=$(env)"
+              else
+                echo "No state for $(env); skipping destroy."
+              fi
+            else
+              echo "Workspace $(env) not found; skipping destroy."
+            fi

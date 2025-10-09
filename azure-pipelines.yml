@@ -180,8 +180,8 @@ stages:
     # Resolve interpreter (prefer python3.11)
     - bash: |
         set -e
-        if command -v python3.11 >/dev/null 2>&1; then
-          PY="$(command -v python3.11)"
+        if command -v python3 >/dev/null 2>&1; then
+          PY="$(command -v python3)"
         elif command -v python3 >/dev/null 2>&1; then
           PY="$(command -v python3)"
         else
@@ -352,7 +352,7 @@ stages:
           # Ensure expected files exist
           test -f "$FUNC_SRC/host.json" || { echo "api-function/host.json missing"; exit 1; }
 
-          # vendor deps into .python_packages so they’re part of the zip
+          # vendor deps into .python_packages so they are part of the zip
           python3 -m pip install --upgrade pip
           python3 -m pip install -r "$FUNC_SRC/requirements.txt" --target "$FUNC_SRC/.python_packages/lib/site-packages"
 

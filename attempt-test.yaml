@@ -16,7 +16,7 @@ variables:
   GO_VERSION: '1.24.5'
   TFSEC_VERSION: 'v1.28.14'
   TFLINT_VERSION: 'v0.59.1'
-  doDestroy: 'true'
+  doDestroy: true
   RG_NAME_PREFIX: 'ascension-up'
   location: 'northeurope'
 
@@ -570,7 +570,7 @@ stages:
           - func_local_test_${{ e }}
           - build_${{ e }}
           - deploy_${{ e }}
-        condition: and(always(), eq(variables['doDestroy'], 'true'))
+        condition: and(always(), eq(variables['doDestroy'], true))
         steps:
           - checkout: self
             clean: true

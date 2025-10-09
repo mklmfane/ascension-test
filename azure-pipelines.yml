@@ -352,7 +352,7 @@ stages:
             az acr login -n "${ACR_NAME}"
 
             # Build & push
-            FRONTEND_DIR="$(Build.SourcesDirectory)/frontend"
+            FRONTEND_DIR="$(Build.SourcesDirectory)/react-frontend-image"
             test -f "$FRONTEND_DIR/Dockerfile" || { echo "frontend/Dockerfile not found"; exit 1; }
             test -f "$FRONTEND_DIR/nginx.conf" || { echo "frontend/nginx.conf not found"; exit 1; }
 
@@ -365,7 +365,7 @@ stages:
             docker push "${IMAGE_URI}"
 
             # Save metadata for the deploy stage
-            META_DIR="$(Build.ArtifactStagingDirectory)/frontend-image"
+            META_DIR="$(Build.ArtifactStagingDirectory)/react-frontend-image"
             mkdir -p "$META_DIR"
             cat > "$META_DIR/image.json" <<EOF
             {
@@ -409,7 +409,7 @@ stages:
     pool: { name: 'ubuntuvm' }
     steps:
       - download: current
-        artifact: frontend-image
+        artifact: react-frontend-image
       - download: current
         artifact: function
       - download: current

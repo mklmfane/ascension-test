@@ -565,10 +565,6 @@ stages:
       - job: destroy_all
         displayName: 'Destroy all'
         pool: { name: 'ubuntuvm' }
-        strategy:
-          matrix:
-            dev:  { env: dev }
-            test: { env: test }
         steps:
           - checkout: self
             clean: true

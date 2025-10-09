@@ -3,9 +3,19 @@
 # --- Build phase ---
 FROM node:20-alpine AS build
 WORKDIR /app
-COPY package*.json ./
+
+# Copy only the manifest first (small layer, great cache)
+COPY package.json ./
+
+# Create a lockfile from package.json (inside the image)
+RUN npm install --package-lock-only
+
+# Install exactly according to that lockfile
 RUN npm ci
+
+# Now bring in the rest of the app
 COPY . .
+
 # Vite production build (dist/)
 RUN npm run build
 

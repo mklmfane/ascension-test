@@ -15,6 +15,7 @@ locals {
   ai_name             = "ai-${var.environment}-ascension"
 
   tags = var.tags
+  same_principal_as_pipeline = var.pipeline_principal_id != null && lower(var.pipeline_principal_id) == lower(data.azurerm_client_config.current.object_id)
 }
 
 data "azurerm_client_config" "current" {}
@@ -94,6 +95,8 @@ data "azurerm_role_definition" "kv_admin" {
 }
 
 resource "azurerm_role_assignment" "kv_admin_self" {
+  count              = local.same_principal_as_pipeline ? 0 : 1
+
   scope              = azurerm_key_vault.kv.id
 
   role_definition_id = data.azurerm_role_definition.kv_admin.id
@@ -106,6 +109,7 @@ data "azurerm_role_definition" "kv_secrets_officer" {
 }
 
 resource "azurerm_role_assignment" "kv_secrets_officer_self" {
+  count              = local.same_principal_as_pipeline ? 0 : 1
   scope              = azurerm_key_vault.kv.id
 
   role_definition_id = data.azurerm_role_definition.kv_secrets_officer.id
@@ -114,7 +118,8 @@ resource "azurerm_role_assignment" "kv_secrets_officer_self" {
 
 # (Optional) also grant to your Azure DevOps service connection principal
 resource "azurerm_role_assignment" "kv_secrets_officer_pipeline" {
-  count             = var.pipeline_principal_id == "" ? 0 : 1
+  count              = local.same_principal_as_pipeline ? 0 : 1
+  #count             = var.pipeline_principal_id == "" ? 0 : 1
 
   scope             = azurerm_key_vault.kv.id
   role_definition_id = data.azurerm_role_definition.kv_secrets_officer.id
@@ -207,6 +212,8 @@ data "azurerm_role_definition" "kv_secrets_user" {
 }
 
 resource "azurerm_role_assignment" "webapp_kv_read" {
+  count              = local.same_principal_as_pipeline ? 0 : 1
+
   scope              = azurerm_key_vault.kv.id
   role_definition_id = data.azurerm_role_definition.kv_secrets_user.id
   principal_id       = azurerm_linux_web_app.react_web.identity[0].principal_id

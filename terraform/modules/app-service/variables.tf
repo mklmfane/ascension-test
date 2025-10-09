@@ -17,6 +17,7 @@ variable "resource_group_location" {
 variable "pipeline_principal_id" {
   description = "Id of pipeline principal to assign role"
   type        = string
+  default     = null
 }
 
 variable "vnet_virtual_network_name" {

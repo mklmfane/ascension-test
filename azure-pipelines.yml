@@ -536,12 +536,8 @@ stages:
           package: '$(Pipeline.Workspace)/function/function.zip'
           deploymentMethod: 'runFromPackage'
 
-- stage: destroy
-  displayName: 'Terraform destroy (guarded)'
-  dependsOn: dev
-  condition: and(succeeded(), eq(variables['doDestroy'], 'true'))
-  jobs:
-  - job: destroy_all
+  - job: destroy_all_dev
+    displayName: 'Destroy all infra (dev)'
     pool: { name: 'ubuntuvm' }
     strategy:
       matrix:
@@ -549,6 +545,7 @@ stages:
     steps:
       - checkout: self
         clean: true
+
       - task: AzureCLI@2
         displayName: "Destroy $(env)"
         inputs:

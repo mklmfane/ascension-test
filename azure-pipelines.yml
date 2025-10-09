@@ -205,8 +205,17 @@ stages:
         mkdir -p "$HOME/.npm-global"
         npm config set prefix "$HOME/.npm-global"
         export PATH="$HOME/.npm-global/bin:$PATH"
-        echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> ~/.bashrc
-        npm i -g azure-functions-core-tools@4 --unsafe-perm true
+        # npm fetch retry knobs
+        export npm_config_fetch_retries=6
+        export npm_config_fetch_retry_factor=2
+        export npm_config_fetch_retry_maxtimeout=120000
+        export npm_config_network_timeout=120000
+
+        n=0
+          until [ $n -ge 5 ]; do
+            npm i -g azure-functions-core-tools@4 --unsafe-perm true && break
+            n=$((n+1)); echo "retry $n/5…"; sleep $((5*n))
+          done
         func --version
       displayName: 'Install Azure Functions Core Tools v4 (user)'
 

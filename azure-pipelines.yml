@@ -219,7 +219,7 @@ stages:
         "$PY" -m venv .venv
         . .venv/bin/activate
         export PIP_DISABLE_PIP_VERSION_CHECK=1
-        python -m pip install -q -r requirements.txt
+        python3 -m pip install -q -r requirements.txt
 
         # ensure package-style imports (Products/)
         export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
@@ -232,7 +232,7 @@ stages:
         # start host
         LOG_FILE="$(Build.SourcesDirectory)/.func.log"
         PID_FILE="$(Build.SourcesDirectory)/.func.pid"
-        nohup func start --python --port 7071 --verbose > "$LOG_FILE" 2>&1 & echo $! > "$PID_FILE"
+        nohup func start --python3 --port 7071 --verbose > "$LOG_FILE" 2>&1 & echo $! > "$PID_FILE"
 
         echo "Waiting for Functions host..."
         ready=0

@@ -536,24 +536,24 @@ stages:
           package: '$(Pipeline.Workspace)/function/function.zip'
           deploymentMethod: 'runFromPackage'
 
-  - job: destroy_all_dev
-    displayName: 'Destroy all infra (dev)'
-    pool: { name: 'ubuntuvm' }
-    strategy:
-      matrix:
-        dev: { env: dev }
-    steps:
-      - checkout: self
-        clean: true
+  # - job: destroy_all_dev
+  #   displayName: 'Destroy all infra (dev)'
+  #   pool: { name: 'ubuntuvm' }
+  #   strategy:
+  #     matrix:
+  #       dev: { env: dev }
+  #   steps:
+  #     - checkout: self
+  #       clean: true
 
-      - task: AzureCLI@2
-        displayName: "Destroy $(env)"
-        inputs:
-          azureSubscription: '$(serviceConnection)'
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -euo pipefail
-            terraform -chdir="$(Build.SourcesDirectory)/terraform" init -input=false
-            terraform -chdir="$(Build.SourcesDirectory)/terraform" workspace select -or-create "$(env)"
-            terraform -chdir="$(Build.SourcesDirectory)/terraform" destroy -no-color -auto-approve -var="workflow=$(env)"
+  #     - task: AzureCLI@2
+  #       displayName: "Destroy $(env)"
+  #       inputs:
+  #         azureSubscription: '$(serviceConnection)'
+  #         scriptType: bash
+  #         scriptLocation: inlineScript
+  #         inlineScript: |
+  #           set -euo pipefail
+  #           terraform -chdir="$(Build.SourcesDirectory)/terraform" init -input=false
+  #           terraform -chdir="$(Build.SourcesDirectory)/terraform" workspace select -or-create "$(env)"
+  #           terraform -chdir="$(Build.SourcesDirectory)/terraform" destroy -no-color -auto-approve -var="workflow=$(env)"

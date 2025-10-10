@@ -476,6 +476,7 @@ stages:
       # 4) DEPLOY (${{ e }}) - deployment job lets you use Environment approvals
       - deployment: deploy_${{ e }}
         displayName: 'Deploy apps (${{ e }})'
+        pool: { name: 'ubuntuvm' }
         dependsOn: build_${{ e }}
         condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
         environment: '${{ e }}'   # put approvals on Environment "test"
@@ -607,6 +608,7 @@ stages:
     pool: { name: 'ubuntuvm' }
     # run destroy once per env, but inside this single final job
     strategy:
+      maxParallel: 1
       matrix:
         ${{ each e in parameters.envs }}:
           ${{ e }}:

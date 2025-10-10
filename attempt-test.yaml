@@ -682,7 +682,7 @@ stages:
   jobs:
     - job: wait_for_approval_test
       displayName: 'Manual approval: proceed to TEST'
-      pool: { name: 'ubuntuvm' }
+      pool: server
       steps:
         - task: ManualValidation@0
           displayName: 'Approve TEST provisioning'
@@ -703,7 +703,7 @@ stages:
   jobs:
     - job: wait_for_approval_prod
       displayName: 'Manual approval: proceed to PROD'
-      pool: { name: 'ubuntuvm' }
+      pool: server
       steps:
         - task: ManualValidation@0
           displayName: 'Approve PROD provisioning'

@@ -114,6 +114,7 @@ stages:
                 # --- Optional lint (best-effort) ---
                 BIN_DIR="$(Agent.TempDirectory)/bin"; mkdir -p "$BIN_DIR"; export PATH="$BIN_DIR:$PATH"
                 tflint --init && tflint --recursive || true
+                # Launch tfsec
                 if command -v tfsec >/dev/null 2>&1; then
                   tfsec "$TF_DIR" || true
                 else

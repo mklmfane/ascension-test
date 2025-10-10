@@ -50,6 +50,25 @@ stages:
           - checkout: self
             clean: true
           
+          # 1) Read SC-CLIENT-ID from the vault and expose it as a masked var
+          - task: AzureCLI@2
+            displayName: 'Get SC_CLIENT_ID from Key Vault'
+            inputs:
+              azureSubscription: '$(serviceConnection)'   # your WIF connection
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                KV_NAME='vault-access-keys'               # or $(kvName)
+                SECRET_NAME='SC-CLIENT-ID'                # your existing secret name
+
+                # Read value via RBAC
+                VAL="$(az keyvault secret show --vault-name "$KV_NAME" --name "$SECRET_NAME" --query value -o tsv)"
+                [ -n "$VAL" ] || { echo "Secret $SECRET_NAME not found in $KV_NAME"; exit 1; }
+
+                # Publish for later tasks (masked in logs)
+                echo "##vso[task.setvariable variable=SC_CLIENT_ID;issecret=true]$VAL"
+
           - task: AzureKeyVault@2
             name: fetch_kv_secrets
             displayName: 'Fetch SC_CLIENT_ID from Key Vault'

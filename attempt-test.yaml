@@ -663,15 +663,17 @@ stages:
 # ---------- FINAL CLEANUP STAGE (runs once, at the end) ----------
 - stage: cleanup
   displayName: 'CLEANUP (destroy all envs)'
-  dependsOn: ${{ parameters.envs }} 
-   # run only if everything before succeeded AND being asked to destroy
+  dependsOn:
+  - ${{ each x in parameters.envs }}:
+    - ${{ x.name }}               # <- expand to stage names: dev, test, prod 
+  # Run only if everything before succeeded AND being asked to destroy
   condition: and(succeeded(), eq(variables['doDestroy'], 'true'))
 
   jobs:
     - job: destroy_all
       displayName: 'Terraform destroy (all envs)'
       pool: { name: 'ubuntuvm' }
-      # run destroy once per env, but inside this single final job
+      # Run destroy once per env, but inside this single final job
       strategy:
         maxParallel: 1
         matrix:

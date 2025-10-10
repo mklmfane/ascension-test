@@ -673,11 +673,11 @@ stages:
       pool: { name: 'ubuntuvm' }
       # run destroy once per env, but inside this single final job
       strategy:
-      maxParallel: 1
-      matrix:
-        ${{ each x in parameters.envs }}:
-          ${{ x.name }}:
-            env: ${{ x.name }}
+        maxParallel: 1
+        matrix:
+          ${{ each x in parameters.envs }}:
+            ${{ x.name }}:
+              env: ${{ x.name }}
       steps:
       - checkout: self
         clean: true

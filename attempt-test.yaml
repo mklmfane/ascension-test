@@ -730,6 +730,8 @@ stages:
   # 1) DESTROY TF RESOURCES (no storage creation)
   - job: destroy_all
     displayName: 'Terraform destroy (all envs)'
+    condition: always()                     # Ensre destroying runs inside the cleanup stage
+    continueOnError: true                   # Try all envs even if one fails
     pool: { name: 'ubuntuvm' }
     strategy:
       maxParallel: 1
@@ -896,6 +898,6 @@ stages:
             done
           fi
 
-          # best-effort delete the now-empty terrafrom state from teh resource group
+          # best-effort delete the now-empty terrafrom state from teh resource RG
           echo "Attempting to delete resource group $RG_STATE (best-effort)..."
           az group delete -n "$RG_STATE" -y --no-wait || true

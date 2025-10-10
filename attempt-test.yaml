@@ -29,6 +29,8 @@ stages:
 - ${{ each x in parameters.envs }}:
   - stage: ${{ x.name }}
     displayName: '${{ upper(x.name) }}'
+    
+    
     ${{ if eq(x.name, 'test') }}:
       dependsOn: dev
       condition: succeeded()
@@ -672,6 +674,46 @@ stages:
                     package: '$(Pipeline.Workspace)/function/function.zip'
                     deploymentMethod: 'runFromPackage'
 
+# --------- APPROVAL GATE: promote to TEST ----------
+- stage: approve_to_test
+  displayName: 'APPROVAL → Promote to TEST'
+  dependsOn: dev
+  condition: succeeded()
+  jobs:
+    - job: wait_for_approval_test
+      displayName: 'Manual approval: proceed to TEST'
+      pool: { name: 'ubuntuvm' }
+      steps:
+        - task: ManualValidation@0
+          displayName: 'Approve TEST provisioning'
+          timeoutInMinutes: 1440   # 24h (adjust as needed)
+          inputs:
+            instructions: |
+              ✅ DEV completed successfully.
+              Approve to start provisioning resources in **TEST**.
+              (This gate blocks the TEST stage until approved.)
+            notifyUsers: 'you@contoso.com; approver2@contoso.com'  # <- set approvers
+            onTimeout: 'reject'   # reject if nobody approves in time
+
+# --------- APPROVAL GATE: promote to PROD ----------
+- stage: approve_to_prod
+  displayName: 'APPROVAL → Promote to PROD'
+  dependsOn: test
+  condition: succeeded()
+  jobs:
+    - job: wait_for_approval_prod
+      displayName: 'Manual approval: proceed to PROD'
+      pool: { name: 'ubuntuvm' }
+      steps:
+        - task: ManualValidation@0
+          displayName: 'Approve PROD provisioning'
+          timeoutInMinutes: 1440
+          inputs:
+            instructions: |
+              ✅ TEST completed successfully.
+              Approve to start provisioning resources in **PROD**.
+            notifyUsers: 'you@contoso.com; approver2@contoso.com'  # <- set approvers
+            onTimeout: 'reject'
 
 # ---------- FINAL CLEANUP STAGE (runs once, at the end) ----------
 - stage: cleanup

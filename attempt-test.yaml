@@ -896,6 +896,6 @@ stages:
             done
           fi
 
-          # best-effort delete the now-empty state RG
+          # best-effort delete the now-empty terrafrom state from teh resource group
           echo "Attempting to delete resource group $RG_STATE (best-effort)..."
           az group delete -n "$RG_STATE" -y --no-wait || true

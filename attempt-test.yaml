@@ -80,6 +80,21 @@ stages:
               # (optional) fail the job if KV is unreachable or secret missing:
           #    failIfMissingSecrets: true
 
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: '$(serviceConnection)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail; set +x
+                KV_NAME="${KV_NAME:?Set kvName}"
+                az keyvault show -n "$KV_NAME" -o none
+                SC_CLIENT_ID="$(az keyvault secret show --vault-name "$KV_NAME" --name SC-CLIENT-ID --query value -o tsv)"
+                OID="$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)"
+                echo "##vso[task.setvariable variable=PIPELINE_PRINCIPAL_OBJECT_ID]$OID"
+            env:
+              KV_NAME: $(kvName)
+
           # 2) Use the secret inside your bash script (no plain text)
           - task: AzureCLI@2
             name: resolve_sp_oid

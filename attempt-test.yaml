@@ -592,50 +592,50 @@ stages:
                     deploymentMethod: 'runFromPackage'
 
 
-# ---------- FINAL CLEANUP STAGE (runs once, at the end) ----------
-- stage: cleanup
-  displayName: 'CLEANUP (destroy all envs)'
-  dependsOn:
-  # make cleanup depend on every env stage produced above
-  ${{ each e in parameters.envs }}:
-    - ${{ e }}
-  # run only if everything before succeeded AND you asked to destroy
-  condition: and(succeeded(), eq(variables['doDestroy'], 'true'))
+# # ---------- FINAL CLEANUP STAGE (runs once, at the end) ----------
+# - stage: cleanup
+#   displayName: 'CLEANUP (destroy all envs)'
+#   dependsOn:
+#   # make cleanup depend on every env stage produced above
+#   ${{ each e in parameters.envs }}:
+#     - ${{ e }}
+#   # run only if everything before succeeded AND you asked to destroy
+#   condition: and(succeeded(), eq(variables['doDestroy'], 'true'))
 
-  jobs:
-  - job: destroy_all
-    displayName: 'Terraform destroy (all envs)'
-    pool: { name: 'ubuntuvm' }
-    # run destroy once per env, but inside this single final job
-    strategy:
-      maxParallel: 1
-      matrix:
-        ${{ each e in parameters.envs }}:
-          ${{ e }}:
-            env: ${{ e }}
-    steps:
-      - checkout: self
-        clean: true
+#   jobs:
+#   - job: destroy_all
+#     displayName: 'Terraform destroy (all envs)'
+#     pool: { name: 'ubuntuvm' }
+#     # run destroy once per env, but inside this single final job
+#     strategy:
+#       maxParallel: 1
+#       matrix:
+#         ${{ each e in parameters.envs }}:
+#           ${{ e }}:
+#             env: ${{ e }}
+#     steps:
+#       - checkout: self
+#         clean: true
 
-      - task: AzureCLI@2
-        displayName: "Destroy $(env)"
-        inputs:
-          azureSubscription: '$(serviceConnection)'
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -euo pipefail
-            TF_DIR="$(Build.SourcesDirectory)/terraform"
-            terraform -chdir="$TF_DIR" init -input=false
+#       - task: AzureCLI@2
+#         displayName: "Destroy $(env)"
+#         inputs:
+#           azureSubscription: '$(serviceConnection)'
+#           scriptType: bash
+#           scriptLocation: inlineScript
+#           inlineScript: |
+#             set -euo pipefail
+#             TF_DIR="$(Build.SourcesDirectory)/terraform"
+#             terraform -chdir="$TF_DIR" init -input=false
 
-            # Only attempt destroy if workspace exists and has state
-            if terraform -chdir="$TF_DIR" workspace list | sed 's/*//;s/ //g' | grep -Fxq "$(env)"; then
-              terraform -chdir="$TF_DIR" workspace select "$(env)"
-              if terraform -chdir="$TF_DIR" state list >/dev/null 2>&1; then
-                terraform -chdir="$TF_DIR" destroy -no-color -auto-approve -var="workflow=$(env)"
-              else
-                echo "No state for $(env); skipping destroy."
-              fi
-            else
-              echo "Workspace $(env) not found; skipping destroy."
-            fi
+#             # Only attempt destroy if workspace exists and has state
+#             if terraform -chdir="$TF_DIR" workspace list | sed 's/*//;s/ //g' | grep -Fxq "$(env)"; then
+#               terraform -chdir="$TF_DIR" workspace select "$(env)"
+#               if terraform -chdir="$TF_DIR" state list >/dev/null 2>&1; then
+#                 terraform -chdir="$TF_DIR" destroy -no-color -auto-approve -var="workflow=$(env)"
+#               else
+#                 echo "No state for $(env); skipping destroy."
+#               fi
+#             else
+#               echo "Workspace $(env) not found; skipping destroy."
+#             fi

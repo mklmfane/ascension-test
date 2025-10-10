@@ -46,6 +46,70 @@ stages:
         steps:
           - checkout: self
             clean: true
+          
+          - task: AzureCLI@2
+            displayName: 'Ensure Terraform state storage (SA + container)'
+            inputs:
+              azureSubscription: '$(serviceConnection)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                ENV="$(env)"
+                RG_NAME="${RG_NAME_PREFIX}-${ENV}--state-rg"
+                LOCATION="$(location)"
+                CONTAINER="tfstate"
+
+                echo "Ensuring RG exists: $RG_NAME"
+                if ! az group exists -n "$RG_NAME" >/dev/null; then
+                  az group create -n "$RG_NAME" -l "$LOCATION" 1>/dev/null
+                fi
+
+                echo "Looking for existing tfstate storage account in $RG_NAME…"
+                SA_NAME="$(az storage account list -g "$RG_NAME" \
+                  --query "[?tags.purpose=='tfstate'] | [0].name" -o tsv || true)"
+
+                # If none tagged, pick first that matches our prefix
+                if [ -z "$SA_NAME" ]; then
+                  SA_NAME="$(az storage account list -g "$RG_NAME" \
+                  --query "[?starts_with(name, 'st${ENV}tf')].name | [0]" -o tsv || true)"
+                fi
+
+                if [ -z "$SA_NAME" ]; then
+                # Create a compliant, mostly stable name (<=24, lowercase, alnum)
+                  BASE="st${ENV}tfstate"
+                  RAND="$(tr -dc 'a-z0-9' </dev/urandom | head -c 6)"
+                  SA_NAME="$(echo "${BASE}${RAND}" | cut -c1-24)"
+                  echo "Creating storage account: $SA_NAME"
+                  az storage account create \
+                    -g "$RG_NAME" -n "$SA_NAME" -l "$LOCATION" \
+                    --sku Standard_LRS --kind StorageV2 \
+                    --min-tls-version TLS1_2 \
+                    --allow-blob-public-access false \
+                    --encryption-services blob \
+                    --tags purpose=tfstate env="$ENV" 1>/dev/null
+                else
+                  echo "Reusing storage account: $SA_NAME"
+                fi
+
+                echo "Ensuring container '${CONTAINER}' exists…"
+                # Use account key to avoid needing data-plane RBAC
+                KEY="$(az storage account keys list -g "$RG_NAME" -n "$SA_NAME" --query "[0].value" -o tsv)"
+                az storage container create \
+                  --name "$CONTAINER" \
+                  --account-name "$SA_NAME" \
+                  --account-key "$KEY" 1>/dev/null
+
+                echo "##vso[task.setvariable variable=TFSTATE_RG]$RG_NAME"
+                echo "##vso[task.setvariable variable=TFSTATE_SA]$SA_NAME"
+                echo "##vso[task.setvariable variable=TFSTATE_CONTAINER]$CONTAINER"
+
+                echo "Terraform backend target:"
+                echo "  resource_group_name = $RG_NAME"
+                echo "  storage_account_name = $SA_NAME"
+                echo "  container_name       = $CONTAINER"
+                echo "  key                  = terraform.${ENV}.tfstate"
 
           - task: AzureCLI@2
             displayName: 'Login + tools + plan/apply (dev)'
@@ -154,6 +218,10 @@ stages:
                 # =========================================================
                 echo ">>> Phase 2: full plan/apply"
                 terraform -chdir="$TF_DIR" plan -no-color -input=false \
+                  -backend-config="resource_group_name=$(TFSTATE_RG)" \
+                  -backend-config="storage_account_name=$(TFSTATE_SA)" \
+                  -backend-config="container_name=$(TFSTATE_CONTAINER)" \
+                  -backend-config="key=terraform.$(env).tfstate" \
                   -var="workflow=$(env)" \
                   -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
                   -var="frontend_image_name=frontend-$(env)" \
@@ -593,46 +661,110 @@ stages:
 
 
 # ---------- FINAL CLEANUP STAGE (runs once, at the end) ----------
-# - stage: cleanup
-#   displayName: 'CLEANUP (destroy all envs)'
-#   dependsOn: ${{ parameters.envs }} 
-#   # run only if everything before succeeded AND you asked to destroy
-#   condition: and(succeeded(), eq(variables['doDestroy'], 'true'))
+- stage: cleanup
+  displayName: 'CLEANUP (destroy all envs)'
+  dependsOn: ${{ parameters.envs }} 
+   # run only if everything before succeeded AND you asked to destroy
+  condition: and(succeeded(), eq(variables['doDestroy'], 'true'))
 
-#   jobs:
-#   - job: destroy_all
-#     displayName: 'Terraform destroy (all envs)'
-#     pool: { name: 'ubuntuvm' }
-#     # run destroy once per env, but inside this single final job
-#     strategy:
-#       maxParallel: 1
-#       matrix:
-#         ${{ each x in parameters.envs }}:
-#           ${{ x.name }}:
-#             env: ${{ x.name }}
-#     steps:
-#       - checkout: self
-#         clean: true
+  jobs:
+    - job: destroy_all
+      displayName: 'Terraform destroy (all envs)'
+      pool: { name: 'ubuntuvm' }
+      # run destroy once per env, but inside this single final job
+      strategy:
+      maxParallel: 1
+      matrix:
+        ${{ each x in parameters.envs }}:
+          ${{ x.name }}:
+            env: ${{ x.name }}
+      steps:
+      - checkout: self
+        clean: true
 
-#       - task: AzureCLI@2
-#         displayName: "Destroy $(env)"
-#         inputs:
-#           azureSubscription: '$(serviceConnection)'
-#           scriptType: bash
-#           scriptLocation: inlineScript
-#           inlineScript: |
-#             set -euo pipefail
-#             TF_DIR="$(Build.SourcesDirectory)/terraform"
-#             terraform -chdir="$TF_DIR" init -input=false
+      - task: AzureCLI@2
+        displayName: 'Ensure Terraform state storage (SA + container)'
+        inputs:
+          azureSubscription: '$(serviceConnection)'
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
 
-#             # Only attempt destroy if workspace exists and has state
-#             if terraform -chdir="$TF_DIR" workspace list | sed 's/*//;s/ //g' | grep -Fxq "$(env)"; then
-#               terraform -chdir="$TF_DIR" workspace select "$(env)"
-#               if terraform -chdir="$TF_DIR" state list >/dev/null 2>&1; then
-#                 terraform -chdir="$TF_DIR" destroy -no-color -auto-approve -var="workflow=$(env)"
-#               else
-#                 echo "No state for $(env); skipping destroy."
-#               fi
-#             else
-#               echo "Workspace $(env) not found; skipping destroy."
-#             fi
+            ENV="$(env)"
+            RG_NAME="${RG_NAME_PREFIX}-${ENV}-rg"
+            LOCATION="$(location)"
+            CONTAINER="tfstate"
+
+            echo "Ensuring RG exists: $RG_NAME"
+            if ! az group exists -n "$RG_NAME" >/dev/null; then
+              az group create -n "$RG_NAME" -l "$LOCATION" 1>/dev/null
+            fi
+
+            echo "Looking for existing tfstate storage account in $RG_NAME…"
+            SA_NAME="$(az storage account list -g "$RG_NAME" \
+              --query "[?tags.purpose=='tfstate'] | [0].name" -o tsv || true)"
+
+            # If none tagged, pick first that matches our prefix
+            if [ -z "$SA_NAME" ]; then
+              SA_NAME="$(az storage account list -g "$RG_NAME" \
+                --query "[?starts_with(name, 'st${ENV}tf')].name | [0]" -o tsv || true)"
+            fi
+
+            if [ -z "$SA_NAME" ]; then
+              # Create a compliant, mostly stable name (<=24, lowercase, alnum)
+              BASE="st${ENV}tfstate"
+              RAND="$(tr -dc 'a-z0-9' </dev/urandom | head -c 6)"
+              SA_NAME="$(echo "${BASE}${RAND}" | cut -c1-24)"
+              echo "Creating storage account: $SA_NAME"
+              az storage account create \
+                -g "$RG_NAME" -n "$SA_NAME" -l "$LOCATION" \
+                --sku Standard_LRS --kind StorageV2 \
+                --min-tls-version TLS1_2 \
+                --allow-blob-public-access false \
+                --encryption-services blob \
+                --tags purpose=tfstate env="$ENV" 1>/dev/null
+            else
+              echo "Reusing storage account: $SA_NAME"
+            fi
+
+            echo "Ensuring container '${CONTAINER}' exists…"
+            # Use account key to avoid needing data-plane RBAC
+            KEY="$(az storage account keys list -g "$RG_NAME" -n "$SA_NAME" --query "[0].value" -o tsv)"
+            az storage container create \
+              --name "$CONTAINER" \
+              --account-name "$SA_NAME" \
+              --account-key "$KEY" 1>/dev/null
+
+            echo "##vso[task.setvariable variable=TFSTATE_RG]$RG_NAME"
+            echo "##vso[task.setvariable variable=TFSTATE_SA]$SA_NAME"
+            echo "##vso[task.setvariable variable=TFSTATE_CONTAINER]$CONTAINER"
+            
+      - task: AzureCLI@2
+        displayName: "Destroy $(env)"
+        inputs:
+          azureSubscription: '$(serviceConnection)'
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
+            TF_DIR="$(Build.SourcesDirectory)/terraform"
+            terraform -chdir="$TF_DIR" init -input=false
+
+            # Only attempt destroy if workspace exists and has state
+            if terraform -chdir="$TF_DIR" workspace list | sed 's/*//;s/ //g' | grep -Fxq "$(env)"; then
+              terraform -chdir="$TF_DIR" workspace select "$(env)"
+              if terraform -chdir="$TF_DIR" state list >/dev/null 2>&1; then
+                terraform -chdir="$TF_DIR" destroy 
+                  -var="workflow=$(env) \
+                  -backend-config="resource_group_name=$(TFSTATE_RG)" \
+                  -backend-config="storage_account_name=$(TFSTATE_SA)" \
+                  -backend-config="container_name=$(TFSTATE_CONTAINER)" \
+                  -backend-config="key=terraform.$(env).tfstate" \
+                  -no-color -auto-approve 
+              else
+                 echo "No state for $(env); skipping destroy."
+              fi
+            else
+              echo "Workspace $(env) not found; skipping destroy."
+            fi

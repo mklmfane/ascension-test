@@ -48,7 +48,7 @@ stages:
             clean: true
           
           - task: AzureCLI@2
-            displayName: 'Ensure Terraform state storage (SA + container)'
+            displayName: 'Terraform state storage existance'
             inputs:
               azureSubscription: '$(serviceConnection)'
               scriptType: bash
@@ -57,22 +57,22 @@ stages:
                 set -euo pipefail
 
                 ENV="$(env)"
-                RG_NAME="${RG_NAME_PREFIX}-${ENV}--state-rg"
+                RG_NAME_STATE="${RG_NAME_PREFIX}-${ENV}-state-rg"
                 LOCATION="$(location)"
                 CONTAINER="tfstate"
 
-                echo "Ensuring RG exists: $RG_NAME"
-                if ! az group exists -n "$RG_NAME" >/dev/null; then
-                  az group create -n "$RG_NAME" -l "$LOCATION" 1>/dev/null
+                echo "Ensuring RG exists: $RG_NAME_STATE"
+                if ! az group exists -n "$RG_NAME_STATE" >/dev/null; then
+                  az group create -n "$RG_NAME_STATE" -l "$LOCATION" 1>/dev/null
                 fi
 
-                echo "Looking for existing tfstate storage account in $RG_NAME…"
-                SA_NAME="$(az storage account list -g "$RG_NAME" \
+                echo "Looking for existing tfstate storage account in $RG_NAME_STATE…"
+                SA_NAME="$(az storage account list -g "$RG_NAME_STATE" \
                   --query "[?tags.purpose=='tfstate'] | [0].name" -o tsv || true)"
 
                 # If none tagged, pick first that matches our prefix
                 if [ -z "$SA_NAME" ]; then
-                  SA_NAME="$(az storage account list -g "$RG_NAME" \
+                  SA_NAME="$(az storage account list -g "$RG_NAME_STATE" \
                   --query "[?starts_with(name, 'st${ENV}tf')].name | [0]" -o tsv || true)"
                 fi
 
@@ -83,7 +83,7 @@ stages:
                   SA_NAME="$(echo "${BASE}${RAND}" | cut -c1-24)"
                   echo "Creating storage account: $SA_NAME"
                   az storage account create \
-                    -g "$RG_NAME" -n "$SA_NAME" -l "$LOCATION" \
+                    -g "$RG_NAME_STATE" -n "$SA_NAME" -l "$LOCATION" \
                     --sku Standard_LRS --kind StorageV2 \
                     --min-tls-version TLS1_2 \
                     --allow-blob-public-access false \
@@ -95,21 +95,21 @@ stages:
 
                 echo "Ensuring container '${CONTAINER}' exists…"
                 # Use account key to avoid needing data-plane RBAC
-                KEY="$(az storage account keys list -g "$RG_NAME" -n "$SA_NAME" --query "[0].value" -o tsv)"
+                KEY="$(az storage account keys list -g "$RG_NAME_STATE" -n "$SA_NAME" --query "[0].value" -o tsv)"
                 az storage container create \
                   --name "$CONTAINER" \
                   --account-name "$SA_NAME" \
                   --account-key "$KEY" 1>/dev/null
-
-                echo "##vso[task.setvariable variable=TFSTATE_RG]$RG_NAME"
-                echo "##vso[task.setvariable variable=TFSTATE_SA]$SA_NAME"
-                echo "##vso[task.setvariable variable=TFSTATE_CONTAINER]$CONTAINER"
-
+                
                 echo "Terraform backend target:"
-                echo "  resource_group_name = $RG_NAME"
+                echo "  resource_group_name = $RG_NAME_STATE"
                 echo "  storage_account_name = $SA_NAME"
                 echo "  container_name       = $CONTAINER"
                 echo "  key                  = terraform.${ENV}.tfstate"
+
+                echo "##vso[task.setvariable variable=TFSTATE_RG]$RG_NAME_STATE"
+                echo "##vso[task.setvariable variable=TFSTATE_SA]$SA_NAME"
+                echo "##vso[task.setvariable variable=TFSTATE_CONTAINER]$CONTAINER"
 
           - task: AzureCLI@2
             displayName: 'Login + tools + plan/apply (dev)'
@@ -195,10 +195,10 @@ stages:
                   --scope "$KV_ID" \
                   --role "$ROLE_NAME" \
                   --query "[0].id" -o tsv || true)
-                if [ -n "$EXIST_SELF" ]; then
-                  echo "Importing existing KV role assignment (self): $EXIST_SELF"
-                  terraform -chdir="$TF_DIR" import "$TF_ADDR_SELF" "$EXIST_SELF" || true
-                fi
+                  if [ -n "$EXIST_SELF" ]; then
+                    echo "Importing existing KV role assignment (self): $EXIST_SELF"
+                    terraform -chdir="$TF_DIR" import "$TF_ADDR_SELF" "$EXIST_SELF" || true
+                  fi
                 fi
 
                 if [ -n "${PIPELINE_PRINCIPAL_OBJECT_ID:-}" ] && [ "${PIPELINE_PRINCIPAL_OBJECT_ID}" != "null" ]; then
@@ -207,10 +207,10 @@ stages:
                     --scope "$KV_ID" \
                     --role "$ROLE_NAME" \
                     --query "[0].id" -o tsv || true)
-                if [ -n "$EXIST_PIPE" ]; then
-                  echo "Importing existing KV role assignment (pipeline): $EXIST_PIPE"
-                  terraform -chdir="$TF_DIR" import "$TF_ADDR_PIPE" "$EXIST_PIPE" || true
-                fi
+                  if [ -n "$EXIST_PIPE" ]; then
+                    echo "Importing existing KV role assignment (pipeline): $EXIST_PIPE"
+                    terraform -chdir="$TF_DIR" import "$TF_ADDR_PIPE" "$EXIST_PIPE" || true
+                  fi
                 fi
 
                 # =========================================================
@@ -664,7 +664,7 @@ stages:
 - stage: cleanup
   displayName: 'CLEANUP (destroy all envs)'
   dependsOn: ${{ parameters.envs }} 
-   # run only if everything before succeeded AND you asked to destroy
+   # run only if everything before succeeded AND being asked to destroy
   condition: and(succeeded(), eq(variables['doDestroy'], 'true'))
 
   jobs:
@@ -692,22 +692,22 @@ stages:
             set -euo pipefail
 
             ENV="$(env)"
-            RG_NAME="${RG_NAME_PREFIX}-${ENV}-rg"
+            RG_NAME_STATE="${RG_NAME_PREFIX}-${ENV}-state-rg"
             LOCATION="$(location)"
             CONTAINER="tfstate"
 
-            echo "Ensuring RG exists: $RG_NAME"
-            if ! az group exists -n "$RG_NAME" >/dev/null; then
-              az group create -n "$RG_NAME" -l "$LOCATION" 1>/dev/null
+            echo "Ensuring RG exists: $RG_NAME_STATE"
+            if ! az group exists -n "$RG_NAME_STATE" >/dev/null; then
+              az group create -n "$RG_NAME_STATE" -l "$LOCATION" 1>/dev/null
             fi
 
-            echo "Looking for existing tfstate storage account in $RG_NAME…"
-            SA_NAME="$(az storage account list -g "$RG_NAME" \
+            echo "Looking for existing tfstate storage account in $RG_NAME_STATE…"
+            SA_NAME="$(az storage account list -g "$RG_NAME_STATE" \
               --query "[?tags.purpose=='tfstate'] | [0].name" -o tsv || true)"
 
             # If none tagged, pick first that matches our prefix
             if [ -z "$SA_NAME" ]; then
-              SA_NAME="$(az storage account list -g "$RG_NAME" \
+              SA_NAME="$(az storage account list -g "$RG_NAME_STATE" \
                 --query "[?starts_with(name, 'st${ENV}tf')].name | [0]" -o tsv || true)"
             fi
 
@@ -718,7 +718,7 @@ stages:
               SA_NAME="$(echo "${BASE}${RAND}" | cut -c1-24)"
               echo "Creating storage account: $SA_NAME"
               az storage account create \
-                -g "$RG_NAME" -n "$SA_NAME" -l "$LOCATION" \
+                -g "$RG_NAME_STATE" -n "$SA_NAME" -l "$LOCATION" \
                 --sku Standard_LRS --kind StorageV2 \
                 --min-tls-version TLS1_2 \
                 --allow-blob-public-access false \
@@ -730,24 +730,17 @@ stages:
 
             echo "Ensuring container '${CONTAINER}' exists…"
             # Use account key to avoid needing data-plane RBAC
-            KEY="$(az storage account keys list -g "$RG_NAME" -n "$SA_NAME" --query "[0].value" -o tsv)"
-            az storage container create \
-              --name "$CONTAINER" \
-              --account-name "$SA_NAME" \
-              --account-key "$KEY" 1>/dev/null
-
-            echo "##vso[task.setvariable variable=TFSTATE_RG]$RG_NAME"
-            echo "##vso[task.setvariable variable=TFSTATE_SA]$SA_NAME"
-            echo "##vso[task.setvariable variable=TFSTATE_CONTAINER]$CONTAINER"
+            SA_KEY="$(az storage account keys list -g "$RG_NAME_STATE" -n "$SA_NAME" --query "[0].value" -o tsv)"
             
-      - task: AzureCLI@2
-        displayName: "Destroy $(env)"
-        inputs:
-          azureSubscription: '$(serviceConnection)'
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -euo pipefail
+            if [ -z "$SA_KEY" ]; then
+              az storage container create \
+                --name "$CONTAINER" \
+                --account-name "$SA_NAME" \
+                --account-key "$KEY" 1>/dev/null
+            else
+              echo "Reusing existing container: $CONTAINER"
+            fi
+
             TF_DIR="$(Build.SourcesDirectory)/terraform"
             terraform -chdir="$TF_DIR" init -input=false
 

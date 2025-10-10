@@ -7,9 +7,9 @@ parameters:
 - name: envs
   type: object
   default:
-    - { name: dev }
-    - { name: test }
-    - { name: prod }   # <-- change to your real ADO Environment name
+    - { name: dev,  envResource: dev }
+    - { name: test, envResource: test }
+    - { name: prod, envResource: production }   # <-- change to your real ADO Environment name
 
 # Global vars
 variables:
@@ -479,7 +479,7 @@ stages:
         pool: { name: 'ubuntuvm' }
         dependsOn: build_${{ x.name }}
         condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
-        environment: '${{ x.name }}'   # put approvals on Environment "test"
+        environment: '${{ x.envResource }}'   # put approvals on Environment "test"
         strategy:
           runOnce:
             deploy:
@@ -607,7 +607,7 @@ stages:
 #     strategy:
 #       maxParallel: 1
 #       matrix:
-#         ${{ each e in parameters.envs }}:
+#         ${{ each x in parameters.envs }}:
 #           ${{ x.name }}:
 #             env: ${{ x.name }}
 #     steps:

@@ -56,115 +56,182 @@ stages:
               inlineScript: |
                 set -euo pipefail
 
-                az account show
-
+                az account show >/dev/null
                 ENV="$(env)"
-
                 LOCATION="$(location)"
-                RG_NAME="${RG_NAME_PREFIX}-${ENV}-state-rg"
-                # fixed, deterministic SA name (<=24 chars, lowercase, alnum)
+
+                # Deterministic names
+                RG_STATE="${RG_NAME_PREFIX}-${ENV}-state-rg"
                 SA_NAME="$(echo "st${RG_NAME_PREFIX}${ENV}tfstate" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-24)"
                 SA_CONTAINER="tfstate"
 
-                # Subscription / tenant (for backend AAD auth)
-                SUB_ID="$(az account show --query id -o tsv)"
-                TENANT_ID="$(az account show --query tenantId -o tsv)"
+                echo "State backend => rg=$RG_STATE sa=$SA_NAME container=$SA_CONTAINER key=terraform.${ENV}.tfstate"
 
-                # Pipeline app (federated) -> object id
-                SC_CLIENT_ID="331a5bcb-b95d-4529-a528-c858e28d9a89"
-                PIPELINE_PRINCIPAL_OBJECT_ID="$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)"
-
-                # --- Optional lint (best-effort) ---
-                BIN_DIR="$(Agent.TempDirectory)/bin"; mkdir -p "$BIN_DIR"; export PATH="$BIN_DIR:$PATH"
-                tflint --init && tflint --recursive || true
-                if command -v tfsec >/dev/null 2>&1; then tfsec "$TF_DIR" || true; else echo "tfsec not installed; skipping."; fi
-
-                # --- Ensure RP is registered (prevents KV 404 flakiness) ---
-                state="$(az provider show -n Microsoft.KeyVault --query registrationState -o tsv || true)"
-                if [ "$state" != "Registered" ]; then
-                  az provider register -n Microsoft.KeyVault 1>/dev/null || true
-                  for i in {1..30}; do
-                    state="$(az provider show -n Microsoft.KeyVault --query registrationState -o tsv || true)"
-                    [ "$state" = "Registered" ] && break || sleep 5
-                  done
-                  echo "Microsoft.KeyVault registration state: ${state:-unknown}"
+                # Ensure RG
+                if ! az group show -n "$RG_STATE" >/dev/null 2>&1; then
+                  az group create -n "$RG_STATE" -l "$LOCATION" 1>/dev/null
                 fi
 
-                TF_DIR="$(Build.SourcesDirectory)/terraform"
-                # --- Grant data-plane role on state SA for AAD backend auth ---
-                SA_ID="$(az storage account show -g "$(RG_NAME)" -n "$(SA_NAME)" --query id -o tsv)"
-                echo "Granting 'Storage Blob Data Contributor' on the state SA scope…"
+                # Ensure Storage Account
+                if ! az storage account show -g "$RG_STATE" -n "$SA_NAME" >/dev/null 2>&1; then
+                  az storage account create \
+                  -g "$RG_STATE" -n "$SA_NAME" -l "$LOCATION" \
+                  --sku Standard_LRS --kind StorageV2 \
+                  --min-tls-version TLS1_2 \
+                  --allow-blob-public-access false \
+                  --encryption-services blob \
+                  --tags purpose=tfstate env="$ENV" 1>/dev/null
+                fi
+
+                # Ensure container (use account key to avoid RBAC delays)
+                SA_KEY="$(az storage account keys list -g "$RG_STATE" -n "$SA_NAME" --query "[0].value" -o tsv)"
+                az storage container create \
+                  --name "$SA_CONTAINER" \
+                  --account-name "$SA_NAME" \
+                  --account-key "$SA_KEY" 1>/dev/null
+
+                # Grant data-plane access to the pipeline principal (for AAD backend)
+                SC_CLIENT_ID="331a5bcb-b95d-4529-a528-c858e28d9a89"
+                PIPELINE_PRINCIPAL_OBJECT_ID="$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv || true)"
+                SA_ID="$(az storage account show -g "$RG_STATE" -n "$SA_NAME" --query id -o tsv)"
+
+                if [ -n "${PIPELINE_PRINCIPAL_OBJECT_ID:-}" ] && [ -n "${SA_ID:-}" ]; then
                 az role assignment create \
                   --assignee-object-id "$PIPELINE_PRINCIPAL_OBJECT_ID" \
                   --role "Storage Blob Data Contributor" \
                   --scope "$SA_ID" >/dev/null || true
-                for i in {1..30}; do
+
+                # small wait for propagation (best-effort)
+                for i in {1..12}; do
                   az role assignment list \
                     --assignee-object-id "$PIPELINE_PRINCIPAL_OBJECT_ID" \
                     --scope "$SA_ID" \
                     --role "Storage Blob Data Contributor" \
                     --query "[0].id" -o tsv | grep -q . && break || sleep 5
-                  done
+                done
+                fi
 
-                # --- Init remote backend (AAD auth, no keys) ---
+                # Export vars for subsequent Terraform init
+                echo "##vso[task.setvariable variable=TFSTATE_RG]$RG_STATE"
+                echo "##vso[task.setvariable variable=TFSTATE_SA]$SA_NAME"
+                echo "##vso[task.setvariable variable=TFSTATE_CONTAINER]$SA_CONTAINER"
+
+          - task: AzureCLI@2
+            displayName: 'Login + tools + plan/apply (dev)'
+            inputs:
+              azureSubscription: '$(serviceConnection)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                az account show
+
+                # Capture subscription/tenant (helps backend auth)
+                SUB_ID="$(az account show --query id -o tsv)"
+                TENANT_ID="$(az account show --query tenantId -o tsv)"  
+
+                TF_DIR="$(Build.SourcesDirectory)/terraform"
+
+                # --- Optional lint (best-effort) ---
+                BIN_DIR="$(Agent.TempDirectory)/bin"; mkdir -p "$BIN_DIR"; export PATH="$BIN_DIR:$PATH"
+                tflint --init && tflint --recursive || true
+
+                # Launch tfsec
+                if command -v tfsec >/dev/null 2>&1; then
+                  tfsec "$TF_DIR" || true
+                else
+                  echo "tfsec not installed; skipping."
+                fi
+
+                # --- Ensure RP is registered (avoids KV 404/NotFound weirdness) ---
+                state="$(az provider show -n Microsoft.KeyVault --query registrationState -o tsv || true)"
+                if [ "$state" != "Registered" ]; then
+                  echo "Registering Microsoft.KeyVault RP..."
+                  az provider register -n Microsoft.KeyVault 1>/dev/null || true
+                  # Wait a bit (usually quick)
+                  for i in {1..30}; do
+                    state="$(az provider show -n Microsoft.KeyVault --query registrationState -o tsv || true)"
+                    [ "$state" = "Registered" ] && break
+                      sleep 5
+                  done
+                  echo "Microsoft.KeyVault registration state: ${state:-unknown}"
+                fi
+
+                # --- Ensure azurerm backend is present + init REMOTE backend up-front ---
+                if ! grep -R 'backend *"azurerm"' -n "$TF_DIR" >/dev/null 2>&1; then
+                  echo 'terraform { backend "azurerm" {} }' > "$TF_DIR/zz_backend.auto.tf"
+                fi
+
                 terraform -chdir="$TF_DIR" init -input=false -reconfigure \
                   -backend-config="use_azuread_auth=true" \
                   -backend-config="subscription_id=${SUB_ID}" \
                   -backend-config="tenant_id=${TENANT_ID}" \
-                  -backend-config="resource_group_name=$(RG_NAME)" \
-                  -backend-config="storage_account_name=$(SA_NAME)" \
-                  -backend-config="container_name=$(SA_CONTAINER)" \
-                  -backend-config="key=terraform.${ENV}.tfstate"
-
-                # --- Workspace FIRST (so imports hit correct workspace) ---
+                  -backend-config="resource_group_name=$(TFSTATE_RG)" \
+                  -backend-config="storage_account_name=$(TFSTATE_SA)" \
+                  -backend-config="container_name=$(TFSTATE_CONTAINER)" \
+                  -backend-config="key=terraform.$(env).tfstate"
+                  
+                # --- Workspace (create/select) ---
                 ensure_ws() {
-                local dir="$1" ws="$2"
-                if terraform -chdir="$dir" workspace list | sed 's/*//;s/ //g' | grep -Fxq "$ws"; then
-                  terraform -chdir="$dir" workspace select "$ws"
-                else
-                  terraform -chdir="$dir" workspace new "$ws"
-                fi
+                  local dir="$1" ws="$2"
+                  if terraform -chdir="$dir" workspace list | sed 's/*//;s/ //g' | grep -Fxq "$ws"; then
+                    terraform -chdir="$dir" workspace select "$ws"
+                  else
+                    terraform -chdir="$dir" workspace new "$ws"
+                  fi
                 }
-                ensure_ws "$TF_DIR" "$ENV"
+                ensure_ws "$TF_DIR" "$(env)"
 
-                # --- Optional import-if-exists for RG (idempotent) ---
+                # --- Import-if-exists guard for Resource Group (idempotent) ---
+                SUB_ID=$(az account show --query id -o tsv)
+                RG_NAME="$(RG_NAME_PREFIX)-$(env)-rg"
                 if az group exists -n "$RG_NAME" >/dev/null; then
-                  if grep -R 'resource *"azurerm_resource_group" *"ascension_test_rg"' "$TF_DIR" >/dev/null 2>&1; then
-                    RG_ADDR="azurerm_resource_group.ascension_test_rg"
-                    if grep -R 'resource *"azurerm_resource_group" *"ascension_test_rg"' -n -A6 "$TF_DIR" | grep -q 'count'; then
-                      RG_ADDR="${RG_ADDR}[0]"
-                    fi
-                  terraform -chdir="$TF_DIR" state show "$RG_ADDR" >/dev/null 2>&1 || \
-                  terraform -chdir="$TF_DIR" import "$RG_ADDR" "/subscriptions/$SUB_ID/resourceGroups/$RG_NAME" || true
-                fi
+                  RG_ADDR="azurerm_resource_group.ascension_test_rg"
+                  if grep -R 'resource *"azurerm_resource_group" *"ascension_test_rg"' -n -A6 "$TF_DIR" | grep -q 'count'; then
+                    RG_ADDR="${RG_ADDR}[0]"
+                  fi
+                  if ! terraform -chdir="$TF_DIR" state show "$RG_ADDR" >/dev/null 2>&1; then
+                    terraform -chdir="$TF_DIR" import "$RG_ADDR" "/subscriptions/$SUB_ID/resourceGroups/$RG_NAME" || true
+                  fi
                 fi
 
-                # --- Full plan/apply (no -target) ---
+                # --- Resolve pipeline principal object id passed to TF ---
+                SC_CLIENT_ID="331a5bcb-b95d-4529-a528-c858e28d9a89"
+                PIPELINE_PRINCIPAL_OBJECT_ID="$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)"
+
+                # =========================================================
+                # Single full plan/apply (NO -target for Key Vault)
+                # =========================================================
                 echo ">>> Full plan/apply"
                 terraform -chdir="$TF_DIR" plan -no-color -input=false \
-                  -var="workflow=$ENV" \
+                  -var="workflow=$(env)" \
                   -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
-                  -var="frontend_image_name=frontend-$ENV" \
+                  -var="frontend_image_name=frontend-$(env)" \
                   -var="frontend_image_tag=${BUILD_BUILDID}" \
-                  -out="tfplan.$ENV.out"
+                  -out="tfplan.$(env).out"
 
                 if [ "$(Build.SourceBranch)" = "refs/heads/main" ]; then
-                  terraform -chdir="$TF_DIR" apply -auto-approve -no-color "tfplan.$ENV.out"
-                  terraform -chdir="$TF_DIR" output -json > "$TF_DIR/tf-outputs.$ENV.json"
+                  terraform -chdir="$TF_DIR" apply -auto-approve -no-color "tfplan.$(env).out"
+                  terraform -chdir="$TF_DIR" output -json > "$TF_DIR/tf-outputs.$(env).json"
                 else
                   echo "Not main branch, skipping apply."
                 fi
 
-                # --- Best-effort KV discovery + idempotent role imports (optional) ---
+                # --- Wait for KV to be queryable (best-effort) ---
                 echo "Waiting for Key Vault to be queryable..."
                 KV_ID=""
                 for i in {1..20}; do
                   KV_ID=$(az keyvault list -g "$RG_NAME" \
-                    --query "[?starts_with(name, 'kv-${ENV}-ascension-')].id | [0]" -o tsv 2>/dev/null || true)
-                [ -n "$KV_ID" ] && break || sleep 6
+                  --query "[?starts_with(name, 'kv-$(env)-ascension-')].id | [0]" -o tsv 2>/dev/null || true)
+                  [ -n "$KV_ID" ] && break || sleep 6
                 done
-                [ -n "$KV_ID" ] && echo "KV_ID=$KV_ID" || echo "KV not discovered yet; continuing."
+                if [ -n "$KV_ID" ]; then
+                  echo "KV_ID=$KV_ID"
+                else
+                  echo "KV not discovered yet; continuing (non-fatal)."
+                fi
 
+                # --- Import-if-exists for KV role assignments (optional, idempotent) ---
                 TF_ADDR_SELF="module.app_service.azurerm_role_assignment.kv_secrets_officer_self"
                 TF_ADDR_PIPE="module.app_service.azurerm_role_assignment.kv_secrets_officer_pipeline[0]"
                 ROLE_NAME="Key Vault Secrets Officer"

@@ -719,104 +719,183 @@ stages:
 - stage: cleanup
   displayName: 'CLEANUP (destroy all envs)'
   dependsOn:
-  - ${{ each x in parameters.envs }}:
-    - ${{ x.name }}               # <- expand to stage names: dev, test, prod 
+    - ${{ each x in parameters.envs }}:
+      - ${{ x.name }}              # dev, test, prod
     - approve_to_test
-    - approve_to_prod  
-  # Run only if everything before succeeded AND being asked to destroy
+    - approve_to_prod
+  # run cleanup even if earlier stages failed, but only when explicitly requested
   condition: and(always(), eq(variables['doDestroy'], 'true'))
 
   jobs:
-    - job: destroy_all
-      displayName: 'Terraform destroy (all envs)'
-      pool: { name: 'ubuntuvm' }
-      # Run destroy once per env, but inside this single final job
-      strategy:
-        maxParallel: 1
-        matrix:
-          ${{ each x in parameters.envs }}:
-            ${{ x.name }}:
-              env: ${{ x.name }}
-      steps:
-      - checkout: self
-        clean: true
+  # 1) DESTROY TF RESOURCES (no storage creation)
+  - job: destroy_all
+    displayName: 'Terraform destroy (all envs)'
+    pool: { name: 'ubuntuvm' }
+    strategy:
+      maxParallel: 1
+      matrix:
+        ${{ each x in parameters.envs }}:
+          ${{ x.name }}:
+            env: ${{ x.name }}
+    steps:
+    - checkout: self
+      clean: true
 
-      - task: AzureCLI@2
-        displayName: 'Ensure Terraform state storage (SA + container)'
-        inputs:
-          azureSubscription: '$(serviceConnection)'
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -euo pipefail
+    - task: AzureCLI@2
+      displayName: 'Destroy $(env) using existing tfstate (no creation)'
+      inputs:
+        azureSubscription: '$(serviceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
 
-            ENV="$(env)"
-            RG_NAME_STATE="${RG_NAME_PREFIX}-${ENV}-state-rg"
-            LOCATION="$(location)"
-            SA_CONTAINER="tfstate"
+          ENV="$(env)"
+          TF_DIR="$(Build.SourcesDirectory)/terraform"
+          RG_STATE="${RG_NAME_PREFIX}-${ENV}-state-rg"
+          CONTAINER="tfstate"
+          # deterministic name you used when provisioning
+          SA_DET="$(echo "st${RG_NAME_PREFIX}${ENV}tfstate" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-24)"
 
-            echo "Ensuring RG exists: $RG_NAME_STATE"
-            if ! az group exists -n "$RG_NAME_STATE" >/dev/null; then
-              az group create -n "$RG_NAME_STATE" -l "$LOCATION" 1>/dev/null
+          echo "Attempting destroy for env=$ENV using backend in RG=$RG_STATE"
+
+          # Collect candidate state accounts (NO CREATION)
+          CANDIDATES=()
+          if az storage account show -g "$RG_STATE" -n "$SA_DET" >/dev/null 2>&1; then
+            CANDIDATES+=("$SA_DET")
+          fi
+          mapfile -t TAGGED < <(az storage account list -g "$RG_STATE" \
+            --query "[?tags.purpose=='tfstate'].name" -o tsv 2>/dev/null || true)
+          for s in "${TAGGED[@]:-}"; do
+            if ! printf '%s\n' "${CANDIDATES[@]}" | grep -Fxq "$s"; then CANDIDATES+=("$s"); fi
+          done
+
+          if [ "${#CANDIDATES[@]}" -eq 0 ]; then
+            echo "No candidate tfstate storage accounts found in $RG_STATE; skipping destroy for $ENV."
+            exit 0
+          fi
+
+          # ensure a backend block exists (file in repo only; does not create Azure resources)
+          if ! grep -R 'backend *\"azurerm\"' -n "$TF_DIR" >/dev/null 2>&1; then
+            echo 'terraform { backend "azurerm" {} }' > "$TF_DIR/zz_backend.auto.tf"
+          fi
+
+          USED_SA=""
+          for SA in "${CANDIDATES[@]}"; do
+            echo "Checking candidate SA: $SA"
+            SA_KEY="$(az storage account keys list -g "$RG_STATE" -n "$SA" --query "[0].value" -o tsv 2>/dev/null || true)"
+            if [ -z "${SA_KEY:-}" ]; then
+              echo "  - cannot read account keys for $SA; trying next..."
+              continue
+            fi
+            HAS_CONTAINER="$(az storage container exists \
+              --name "$CONTAINER" \
+              --account-name "$SA" \
+              --account-key "$SA_KEY" \
+              --query exists -o tsv 2>/dev/null || echo false)"
+            if [ "$HAS_CONTAINER" != "true" ]; then
+              echo "  - container '$CONTAINER' does not exist in $SA; trying next..."
+              continue
             fi
 
-            echo "Looking for existing tfstate storage account in $RG_NAME_STATE…"
-            SA_NAME="$(az storage account list -g "$RG_NAME_STATE" \
-              --query "[?tags.purpose=='tfstate'] | [0].name" -o tsv || true)"
-
-            # If none tagged, pick first that matches our prefix
-            if [ -z "$SA_NAME" ]; then
-              SA_NAME="$(az storage account list -g "$RG_NAME_STATE" \
-                --query "[?starts_with(name, 'st${ENV}tf')].name | [0]" -o tsv || true)"
-            fi
-
-            if [ -z "$SA_NAME" ]; then
-              # Create a compliant, mostly stable name (<=24, lowercase, alnum)
-              BASE="st${ENV}tfstate"
-              RAND="$(tr -dc 'a-z0-9' </dev/urandom | head -c 6)"
-              SA_NAME="$(echo "${BASE}${RAND}" | cut -c1-24)"
-              echo "Creating storage account: $SA_NAME"
-              az storage account create \
-                -g "$RG_NAME_STATE" -n "$SA_NAME" -l "$LOCATION" \
-                --sku Standard_LRS --kind StorageV2 \
-                --min-tls-version TLS1_2 \
-                --allow-blob-public-access false \
-                --encryption-services blob \
-                --tags purpose=tfstate env="$ENV" 1>/dev/null
+            echo "Trying terraform init with SA=$SA ..."
+            if terraform -chdir="$TF_DIR" init -input=false -reconfigure \
+                -backend-config="resource_group_name=${RG_STATE}" \
+                -backend-config="storage_account_name=${SA}" \
+                -backend-config="container_name=${CONTAINER}" \
+                -backend-config="key=terraform.${ENV}.tfstate" \
+                -backend-config="access_key=${SA_KEY}"; then
+              USED_SA="$SA"
+              break
             else
-              echo "Reusing storage account: $SA_NAME"
+              echo "  - terraform init failed with SA=$SA; trying next..."
             fi
+          done
 
-            echo "Ensuring container '${SA_CONTAINER}' exists…"
-            # Use account key to avoid needing data-plane RBAC
-            SA_KEY="$(az storage account keys list -g "$RG_NAME_STATE" -n "$SA_NAME" --query "[0].value" -o tsv)"
-            
-            if [ -z "$SA_KEY" ]; then
-              az storage container create \
-                --name "$SA_CONTAINER" \
-                --account-name "$SA_NAME" \
-                --account-key "$KEY" 1>/dev/null
-            else
-              echo "Reusing existing container: $SA_CONTAINER"
+          if [ -z "$USED_SA" ]; then
+            echo "No usable backend found; skipping destroy for $ENV."
+            exit 0
+          fi
+
+          # workspace: select only if exists
+          if terraform -chdir="$TF_DIR" workspace list | sed 's/*//;s/ //g' | grep -Fxq "$ENV"; then
+            terraform -chdir="$TF_DIR" workspace select "$ENV"
+          else
+            echo "Workspace $ENV not found; skipping destroy."
+            exit 0
+          fi
+
+          # run destroy only if there is state
+          if terraform -chdir="$TF_DIR" state list >/dev/null 2>&1; then
+            echo "Running terraform destroy for $ENV ..."
+            terraform -chdir="$TF_DIR" destroy -auto-approve -no-color -input=false \
+              -var="workflow=${ENV}"
+          else
+            echo "No state objects present for $ENV; skipping destroy."
+          fi
+
+  # 2) MANUAL APPROVAL (agentless) BEFORE DELETING STATE SAs
+  - job: approve_delete_state
+    displayName: 'Manual approval to remove tfstate storage accounts'
+    pool: server   # IMPORTANT: ManualValidation requires an agentless server job
+    dependsOn: destroy_all
+    condition: succeeded()   # only if destroy_all succeeded
+    steps:
+    - task: ManualValidation@0
+      timeoutInMinutes: 1440
+      inputs:
+        notifyUsers: 'mircea_constantin58@yahoo.com'  # <-- set approvers
+        instructions: |
+          ✅ Terraform destroy completed for all environments included in this run.
+          Approve to permanently delete ALL tfstate storage accounts and their state containers.
+          This will remove the ability to recover Terraform state for these environments.
+        onTimeout: 'reject'
+
+  # 3) DELETE TFSTATE STORAGE ACCOUNTS (after approval)
+  - job: delete_state
+    displayName: 'Delete tfstate storage accounts (all envs)'
+    pool: { name: 'ubuntuvm' }
+    dependsOn: approve_delete_state
+    condition: succeeded()   # only after approval
+    strategy:
+      maxParallel: 1
+      matrix:
+        ${{ each x in parameters.envs }}:
+          ${{ x.name }}:
+            env: ${{ x.name }}
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Remove tfstate SAs for $(env)'
+      inputs:
+        azureSubscription: '$(serviceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+          ENV="$(env)"
+          RG_STATE="${RG_NAME_PREFIX}-${ENV}-state-rg"
+          SA_DET="$(echo "st${RG_NAME_PREFIX}${ENV}tfstate" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-24)"
+
+          echo "Deleting tfstate storage accounts for env=$ENV in rg=$RG_STATE"
+
+          # gather all tfstate SAs
+          mapfile -t SA_LIST < <(az storage account list -g "$RG_STATE" \
+            --query "[?tags.purpose=='tfstate'].name" -o tsv 2>/dev/null || true)
+          if az storage account show -g "$RG_STATE" -n "$SA_DET" >/dev/null 2>&1; then
+            if ! printf '%s\n' "${SA_LIST[@]}" | grep -Fxq "$SA_DET"; then
+              SA_LIST+=("$SA_DET")
             fi
+          fi
 
-            TF_DIR="$(Build.SourcesDirectory)/terraform"
-            terraform -chdir="$TF_DIR" init -input=false
+          if [ "${#SA_LIST[@]}" -eq 0 ]; then
+            echo "No tfstate storage accounts found in $RG_STATE."
+          else
+            for SA in "${SA_LIST[@]}"; do
+              echo "Deleting storage account: $SA (rg: $RG_STATE)"
+              az storage account delete -g "$RG_STATE" -n "$SA" -y || true
+            done
+          fi
 
-            # Only attempt destroy if workspace exists and has state
-            if terraform -chdir="$TF_DIR" workspace list | sed 's/*//;s/ //g' | grep -Fxq "$(env)"; then
-              terraform -chdir="$TF_DIR" workspace select "$(env)"
-              if terraform -chdir="$TF_DIR" state list >/dev/null 2>&1; then
-                terraform -chdir="$TF_DIR" destroy 
-                  -var="workflow=$(env) \
-                  -backend-config="resource_group_name=$(RG_NAME_STATE)" \
-                  -backend-config="storage_account_name=$(SA_NAME)" \
-                  -backend-config="container_name=$(SA_CONTAINER)" \
-                  -backend-config="key=terraform.$(env).tfstate" \
-                  -no-color -auto-approve 
-              else
-                 echo "No state for $(env); skipping destroy."
-              fi
-            else
-              echo "Workspace $(env) not found; skipping destroy."
-            fi
+          # best-effort delete the now-empty state RG
+          echo "Attempting to delete resource group $RG_STATE (best-effort)..."
+          az group delete -n "$RG_STATE" -y --no-wait || true

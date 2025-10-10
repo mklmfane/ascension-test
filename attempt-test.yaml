@@ -63,6 +63,7 @@ stages:
                 SA_NAME="$(echo "st${RG_NAME_PREFIX}${ENV}tfstate" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-24)"
                 CONTAINER="tfstate"
 
+
                 echo "Backend target => RG=$RG_STATE SA=$SA_NAME container=$CONTAINER key=terraform.${ENV}.tfstate"
 
                 # Ensure RG exists
@@ -109,11 +110,16 @@ stages:
                 set -euo pipefail
                 az account show
 
+                # Capture subscription/tenant (helps backend auth)
+                SUB_ID="$(az account show --query id -o tsv)"
+                TENANT_ID="$(az account show --query tenantId -o tsv)"  
+
                 TF_DIR="$(Build.SourcesDirectory)/terraform"
 
                 # --- Optional lint (best-effort) ---
                 BIN_DIR="$(Agent.TempDirectory)/bin"; mkdir -p "$BIN_DIR"; export PATH="$BIN_DIR:$PATH"
                 tflint --init && tflint --recursive || true
+
                 # Launch tfsec
                 if command -v tfsec >/dev/null 2>&1; then
                   tfsec "$TF_DIR" || true
@@ -141,11 +147,14 @@ stages:
                 fi
 
                 terraform -chdir="$TF_DIR" init -input=false -reconfigure \
+                  -backend-config="use_azuread_auth=true" \
+                  -backend-config="subscription_id=${SUB_ID}" \
+                  -backend-config="tenant_id=${TENANT_ID}" \
                   -backend-config="resource_group_name=$(TFSTATE_RG)" \
                   -backend-config="storage_account_name=$(TFSTATE_SA)" \
                   -backend-config="container_name=$(TFSTATE_CONTAINER)" \
                   -backend-config="key=terraform.$(env).tfstate"
-
+                  
                 # --- Workspace (create/select) ---
                 ensure_ws() {
                   local dir="$1" ws="$2"

@@ -8,11 +8,15 @@ LOCATION="northeurope"
 RG_STATE="${RG_NAME_PREFIX}-${ENV}-state-rg"
 # fixed, deterministic SA name (<=24 chars, lowercase, alnum)
 SA_NAME="$(echo "st${RG_NAME_PREFIX}${ENV}tfstate" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-24)"
-CONTAINER="tfstate-${ENV}"
+TFSTATE_CONTAINER="tfstate-${ENV}"
 
 TFSTATE_RG="${RG_NAME_PREFIX}-${ENV}-state-rg"
 TFSTATE_SA="$(echo "st${RG_NAME_PREFIX}${ENV}tfstate" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-24)"
-TFSTATE_CONTAINER="container"
+
+# Capture subscription/tenant (helps backend auth)
+SUB_ID="$(az account show --query id -o tsv)"
+TENANT_ID="$(az account show --query tenantId -o tsv)"
+
 
 echo "Backend target => RG=$RG_STATE SA=$SA_NAME container=$CONTAINER key=terraform.${ENV}.tfstate"
 
@@ -49,4 +53,7 @@ terraform  init -input=false -reconfigure \
  -backend-config="resource_group_name=$(TFSTATE_RG)" \
  -backend-config="storage_account_name=$(TFSTATE_SA)" \
  -backend-config="container_name=$(TFSTATE_CONTAINER)" \
- -backend-config="key=terraform.$(env).tfstate"
+ -backend-config="key=terraform.$(env).tfstate" \
+ -backend-config="use_azuread_auth=true" \
+ -backend-config="subscription_id=${SUB_ID}" \
+ -backend-config="tenant_id=${TENANT_ID}"

@@ -592,13 +592,10 @@ stages:
                     deploymentMethod: 'runFromPackage'
 
 
-# # ---------- FINAL CLEANUP STAGE (runs once, at the end) ----------
+# ---------- FINAL CLEANUP STAGE (runs once, at the end) ----------
 # - stage: cleanup
 #   displayName: 'CLEANUP (destroy all envs)'
-#   dependsOn:
-#   # make cleanup depend on every env stage produced above
-#   ${{ each e in parameters.envs }}:
-#     - ${{ e }}
+#   dependsOn: ${{ parameters.envs }} 
 #   # run only if everything before succeeded AND you asked to destroy
 #   condition: and(succeeded(), eq(variables['doDestroy'], 'true'))
 

@@ -86,11 +86,44 @@ stages:
               scriptType: bash
               scriptLocation: inlineScript
               inlineScript: |
-                set -euo pipefail; set +x
-                KV_NAME="${KV_NAME:?Set kvName}"
-                az keyvault show -n "$KV_NAME" -o none
-                SC_CLIENT_ID="$(az keyvault secret show --vault-name "$KV_NAME" --name SC-CLIENT-ID --query value -o tsv)"
-                OID="$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)"
+                set -euo pipefail
+                set +x  # never echo secrets
+
+                SUB_ID="$(az account show --query id -o tsv)"
+                KV_NAME="${KV_NAME:-}"
+                if [ -z "$KV_NAME" ]; then
+                  echo "ERROR: KV_NAME is empty. Set variables.kvName or pass env KV_NAME." >&2
+                  exit 1
+                fi
+
+                echo "Looking for Key Vault '$KV_NAME' in subscription $SUB_ID ..."
+                if ! az keyvault show -n "$KV_NAME" -o none 2>/dev/null; then
+                  echo "ERROR: Vault '$KV_NAME' not found in subscription $SUB_ID." >&2
+                  echo "Available vaults in this subscription:" >&2
+                  az keyvault list --query "[].{name:name, rg:resourceGroup, location:location}" -o table || true
+                  echo "If your vault is in a different subscription, point the service connection to that subscription." >&2
+                  exit 1
+                fi
+
+                # Fetch the clientId stored as secret
+                SC_CLIENT_ID="$(az keyvault secret show \
+                  --vault-name "$KV_NAME" \
+                  --name 'SC-CLIENT-ID' \
+                  --query value -o tsv --only-show-errors)"
+
+                if [ -z "${SC_CLIENT_ID:-}" ]; then
+                  echo "ERROR: Secret 'SC-CLIENT-ID' not found or empty in vault '$KV_NAME'." >&2
+                  exit 1
+                fi
+
+                # Resolve service principal objectId for later role assignments / TF vars
+                OID="$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv --only-show-errors || true)"
+                if [ -z "${OID:-}" ]; then
+                  echo "ERROR: Could not resolve AAD objectId for clientId from Key Vault." >&2
+                  exit 1
+                fi
+
+                # Export for later tasks (no need to persist SC_CLIENT_ID)
                 echo "##vso[task.setvariable variable=PIPELINE_PRINCIPAL_OBJECT_ID]$OID"
             env:
               KV_NAME: $(kvName)

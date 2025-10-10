@@ -692,7 +692,7 @@ stages:
               ✅ DEV completed successfully.
               Approve to start provisioning resources in **TEST**.
               (This gate blocks the TEST stage until approved.)
-            notifyUsers: 'you@contoso.com; approver2@contoso.com'  # <- set approvers
+            notifyUsers: 'mircea_constantin58@yahoo.com'  # <- set approvers
             onTimeout: 'reject'   # reject if nobody approves in time
 
 # --------- APPROVAL GATE: promote to PROD ----------
@@ -712,7 +712,7 @@ stages:
             instructions: |
               ✅ TEST completed successfully.
               Approve to start provisioning resources in **PROD**.
-            notifyUsers: 'you@contoso.com; approver2@contoso.com'  # <- set approvers
+            notifyUsers: 'mircea_constantin58@yahoo.com'  # <- set approvers
             onTimeout: 'reject'
 
 # ---------- FINAL CLEANUP STAGE (runs once, at the end) ----------

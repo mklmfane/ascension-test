@@ -7,9 +7,9 @@ parameters:
 - name: envs
   type: object
   default:
-    - { name: dev,  envResource: dev }
-    - { name: test, envResource: test }
-    - { name: prod, envResource: production }   # <-- change to your real ADO Environment name
+    - { name: dev }
+    - { name: test }
+    - { name: prod }   # <-- change to your real ADO Environment name
 
 # Global vars
 variables:

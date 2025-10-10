@@ -69,16 +69,16 @@ stages:
                 # Publish for later tasks (masked in logs)
                 echo "##vso[task.setvariable variable=SC_CLIENT_ID;issecret=true]$VAL"
 
-          - task: AzureKeyVault@2
-            name: fetch_kv_secrets
-            displayName: 'Fetch SC_CLIENT_ID from Key Vault'
-            inputs:
-              azureSubscription: '$(serviceConnection)'       # your WIF service connection
-              KeyVaultName: '$(kvName)'
-              SecretsFilter: 'SC-CLIENT-ID'                   # the exact secret name in KV
-              RunAsPreJob: true                               # fetch before other steps
+          #- task: AzureKeyVault@2
+          #  name: fetch_kv_secrets
+          #  displayName: 'Fetch SC_CLIENT_ID from Key Vault'
+          #  inputs:
+          #    azureSubscription: '$(serviceConnection)'       # your WIF service connection
+          #    KeyVaultName: '$(kvName)'
+          #    SecretsFilter: 'SC-CLIENT-ID'                   # the exact secret name in KV
+          #    RunAsPreJob: true                               # fetch before other steps
               # (optional) fail the job if KV is unreachable or secret missing:
-              failIfMissingSecrets: true
+          #    failIfMissingSecrets: true
 
           # 2) Use the secret inside your bash script (no plain text)
           - task: AzureCLI@2

@@ -59,8 +59,12 @@ stages:
                 az account show
 
                 ENV="$(env)"
-                RG_NAME="${RG_NAME_PREFIX}-${ENV}-rg"
-                TF_DIR="$(Build.SourcesDirectory)/terraform"
+
+                LOCATION="$(location)"
+                RG_NAME="${RG_NAME_PREFIX}-${ENV}-state-rg"
+                # fixed, deterministic SA name (<=24 chars, lowercase, alnum)
+                SA_NAME="$(echo "st${RG_NAME_PREFIX}${ENV}tfstate" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-24)"
+                SA_CONTAINER="tfstate"
 
                 # Subscription / tenant (for backend AAD auth)
                 SUB_ID="$(az account show --query id -o tsv)"
@@ -86,8 +90,9 @@ stages:
                   echo "Microsoft.KeyVault registration state: ${state:-unknown}"
                 fi
 
+                TF_DIR="$(Build.SourcesDirectory)/terraform"
                 # --- Grant data-plane role on state SA for AAD backend auth ---
-                SA_ID="$(az storage account show -g "$(TFSTATE_RG)" -n "$(TFSTATE_SA)" --query id -o tsv)"
+                SA_ID="$(az storage account show -g "$(RG_NAME)" -n "$(SA_NAME)" --query id -o tsv)"
                 echo "Granting 'Storage Blob Data Contributor' on the state SA scope…"
                 az role assignment create \
                   --assignee-object-id "$PIPELINE_PRINCIPAL_OBJECT_ID" \
@@ -106,9 +111,9 @@ stages:
                   -backend-config="use_azuread_auth=true" \
                   -backend-config="subscription_id=${SUB_ID}" \
                   -backend-config="tenant_id=${TENANT_ID}" \
-                  -backend-config="resource_group_name=$(TFSTATE_RG)" \
-                  -backend-config="storage_account_name=$(TFSTATE_SA)" \
-                  -backend-config="container_name=$(TFSTATE_CONTAINER)" \
+                  -backend-config="resource_group_name=$(RG_NAME)" \
+                  -backend-config="storage_account_name=$(SA_NAME)" \
+                  -backend-config="container_name=$(SA_CONTAINER)" \
                   -backend-config="key=terraform.${ENV}.tfstate"
 
                 # --- Workspace FIRST (so imports hit correct workspace) ---
@@ -637,7 +642,7 @@ stages:
             ENV="$(env)"
             RG_NAME_STATE="${RG_NAME_PREFIX}-${ENV}-state-rg"
             LOCATION="$(location)"
-            CONTAINER="tfstate"
+            SA_CONTAINER="tfstate"
 
             echo "Ensuring RG exists: $RG_NAME_STATE"
             if ! az group exists -n "$RG_NAME_STATE" >/dev/null; then
@@ -671,17 +676,17 @@ stages:
               echo "Reusing storage account: $SA_NAME"
             fi
 
-            echo "Ensuring container '${CONTAINER}' exists…"
+            echo "Ensuring container '${SA_CONTAINER}' exists…"
             # Use account key to avoid needing data-plane RBAC
             SA_KEY="$(az storage account keys list -g "$RG_NAME_STATE" -n "$SA_NAME" --query "[0].value" -o tsv)"
             
             if [ -z "$SA_KEY" ]; then
               az storage container create \
-                --name "$CONTAINER" \
+                --name "$SA_CONTAINER" \
                 --account-name "$SA_NAME" \
                 --account-key "$KEY" 1>/dev/null
             else
-              echo "Reusing existing container: $CONTAINER"
+              echo "Reusing existing container: $SA_CONTAINER"
             fi
 
             TF_DIR="$(Build.SourcesDirectory)/terraform"
@@ -693,9 +698,9 @@ stages:
               if terraform -chdir="$TF_DIR" state list >/dev/null 2>&1; then
                 terraform -chdir="$TF_DIR" destroy 
                   -var="workflow=$(env) \
-                  -backend-config="resource_group_name=$(TFSTATE_RG)" \
-                  -backend-config="storage_account_name=$(TFSTATE_SA)" \
-                  -backend-config="container_name=$(TFSTATE_CONTAINER)" \
+                  -backend-config="resource_group_name=$(RG_NAME_STATE)" \
+                  -backend-config="storage_account_name=$(SA_NAME)" \
+                  -backend-config="container_name=$(SA_CONTAINER)" \
                   -backend-config="key=terraform.$(env).tfstate" \
                   -no-color -auto-approve 
               else

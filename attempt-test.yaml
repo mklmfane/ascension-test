@@ -7,9 +7,9 @@ parameters:
 - name: envs
   type: object
   default:
-    - dev
-    - test
-    - prod
+    - { name: dev,  envResource: dev }
+    - { name: test, envResource: test }
+    - { name: prod, envResource: production }   # <-- change to your real ADO Environment name
 
 # Global vars
 variables:
@@ -27,21 +27,21 @@ variables:
 stages:
 # Loop must be under "stages:"
 - ${{ each e in parameters.envs }}:
-  - stage: ${{ e }}
-    displayName: '${{ upper(e) }}'
-    ${{ if eq(e, 'test') }}:
+  - stage: ${{ x.name }}
+    displayName: '${{ upper(x.name) }}'
+    ${{ if eq(x.name, 'test') }}:
       dependsOn: dev
       condition: succeeded()
-    ${{ if eq(e, 'prod') }}:
+    ${{ if eq(x.name, 'prod') }}:
       dependsOn: test
       condition: succeeded()
     variables:
-      env: ${{ e }}
+      env: ${{ x.name }}
     jobs:
 
-      # 1) INFRA (${{ e }})
-      - job: infra_${{ e }}
-        displayName: 'Provision infra (${{ e }})'
+      # 1) INFRA (${{ x.name }})
+      - job: infra_${{ x.name }}
+        displayName: 'Provision infra (${{ x.name }})'
         pool: { name: 'ubuntuvm' }
         steps:
           - checkout: self
@@ -173,9 +173,9 @@ stages:
             displayName: 'Publish tf-outputs'
 
 
-      # 2) LOCAL FUNCTION TEST (${{ e }})
-      - job: func_local_test_${{ e }}
-        displayName: 'Azure Function local test (${{ e }})'
+      # 2) LOCAL FUNCTION TEST (${{ x.name }})
+      - job: func_local_test_${{ x.name }}
+        displayName: 'Azure Function local test (${{ x.name }})'
         pool: { name: 'ubuntuvm' }
         steps:
           - checkout: self
@@ -315,12 +315,12 @@ stages:
             condition: always()
 
 
-      # 3) BUILD (${{ e }})
-      - job: build_${{ e }}
-        displayName: 'Build frontend & package function (${{ e }})'
+      # 3) BUILD (${{ x.name }})
+      - job: build_${{ x.name }}
+        displayName: 'Build frontend & package function (${{ x.name }})'
         dependsOn:
-          - infra_${{ e }}
-          - func_local_test_${{ e }}
+          - infra_${{ x.name }}
+          - func_local_test_${{ x.name }}
         condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
         pool: { name: 'ubuntuvm' }
         steps:
@@ -473,13 +473,13 @@ stages:
             artifact: function
 
 
-      # 4) DEPLOY (${{ e }}) - deployment job lets you use Environment approvals
-      - deployment: deploy_${{ e }}
-        displayName: 'Deploy apps (${{ e }})'
+      # 4) DEPLOY (${{ x.name }}) - deployment job lets you use Environment approvals
+      - deployment: deploy_${{ x.name }}
+        displayName: 'Deploy apps (${{ x.name }})'
         pool: { name: 'ubuntuvm' }
-        dependsOn: build_${{ e }}
+        dependsOn: build_${{ x.name }}
         condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
-        environment: '${{ e }}'   # put approvals on Environment "test"
+        environment: '${{ x.name }}'   # put approvals on Environment "test"
         strategy:
           runOnce:
             deploy:
@@ -608,8 +608,8 @@ stages:
 #       maxParallel: 1
 #       matrix:
 #         ${{ each e in parameters.envs }}:
-#           ${{ e }}:
-#             env: ${{ e }}
+#           ${{ x.name }}:
+#             env: ${{ x.name }}
 #     steps:
 #       - checkout: self
 #         clean: true

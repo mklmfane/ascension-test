@@ -26,7 +26,7 @@ variables:
 # ===========================
 stages:
 # Loop must be under "stages:"
-- ${{ each e in parameters.envs }}:
+- ${{ each x in parameters.envs }}:
   - stage: ${{ x.name }}
     displayName: '${{ upper(x.name) }}'
     ${{ if eq(x.name, 'test') }}:

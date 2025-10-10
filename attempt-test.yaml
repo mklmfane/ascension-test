@@ -63,29 +63,42 @@ stages:
 
           # 2) Use the secret inside your bash script (no plain text)
           - task: AzureCLI@2
-            displayName: 'Ensure Terraform state storage exists'
+            name: resolve_sp_oid
+            displayName: 'Resolve pipeline principal OID from Key Vault (fast)'
             inputs:
               azureSubscription: '$(serviceConnection)'
               scriptType: bash
               scriptLocation: inlineScript
               inlineScript: |
                 set -euo pipefail
+                # IMPORTANT: never echo secrets; also make sure xtrace is off
+                set +x
 
-                # SC_CLIENT_ID is injected via env mapping below (and masked in logs)
-                : "${SC_CLIENT_ID:?Secret 'SC-CLIENT-ID' not found. Check Key Vault name/permissions.}"
+                # Expect KV name via env var mapping below
+                : "${KV_NAME:?Set pipeline variable kvName or env KV_NAME}"
 
-                echo "Using SC_CLIENT_ID from Key Vault (redacted)."
+                echo "Fetching SC-CLIENT-ID from Key Vault '$KV_NAME'…"
+                SC_CLIENT_ID="$(az keyvault secret show \
+                  --vault-name "$KV_NAME" \
+                  --name "SC-CLIENT-ID" \
+                  --query value -o tsv --only-show-errors)"
 
-                # Example: resolve object id for later role assignments / TF vars
-                PIPELINE_PRINCIPAL_OBJECT_ID="$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)"
+                if [ -z "${SC_CLIENT_ID:-}" ]; then
+                  echo "ERROR: Secret 'SC-CLIENT-ID' not found or empty in vault '$KV_NAME'." >&2
+                  exit 1
+                fi
 
-                # (Optional) make it available to later steps as a masked pipeline variable
-                #echo "##vso[task.setvariable variable=SC_CLIENT_ID;issecret=true]$SC_CLIENT_ID"
+                # Resolve AAD objectId of the service principal
+                PIPELINE_PRINCIPAL_OBJECT_ID="$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv --only-show-errors)"
+                if [ -z "${PIPELINE_PRINCIPAL_OBJECT_ID:-}" ]; then
+                  echo "ERROR: Could not resolve objectId for clientId from Key Vault." >&2
+                  exit 1
+                fi
+
+                # Expose to later tasks (no need to persist the clientId)
                 echo "##vso[task.setvariable variable=PIPELINE_PRINCIPAL_OBJECT_ID]$PIPELINE_PRINCIPAL_OBJECT_ID"
             env:
-              # Map the KV secret (pipeline var) to a clean env var name for bash
-              SC_CLIENT_ID: $(SC-CLIENT-ID)
-              #KV_NAME: $(kvName)   # (optional) if you want it in the script too
+              KV_NAME: $(kvName)
 
           - task: AzureCLI@2
             displayName: 'Ensure Terraform state storage exists'

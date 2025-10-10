@@ -721,8 +721,10 @@ stages:
   dependsOn:
   - ${{ each x in parameters.envs }}:
     - ${{ x.name }}               # <- expand to stage names: dev, test, prod 
+    - approve_to_test
+    - approve_to_prod  
   # Run only if everything before succeeded AND being asked to destroy
-  condition: and(succeeded(), eq(variables['doDestroy'], 'true'))
+  condition: and(always(), eq(variables['doDestroy'], 'true'))
 
   jobs:
     - job: destroy_all

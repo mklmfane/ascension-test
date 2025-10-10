@@ -20,6 +20,7 @@ variables:
   doDestroy: true
   RG_NAME_PREFIX: 'ascension-up'
   location: 'northeurope'
+  kvName: 'vault-access-key-access' 
 
 # ===========================
 # Stages generated per env
@@ -49,6 +50,43 @@ stages:
           - checkout: self
             clean: true
           
+          - task: AzureKeyVault@2
+            name: fetch_kv_secrets
+            displayName: 'Fetch SC_CLIENT_ID from Key Vault'
+            inputs:
+              azureSubscription: '$(serviceConnection)'       # your WIF service connection
+              KeyVaultName: '$(kvName)'
+              SecretsFilter: 'SC-CLIENT-ID'                   # the exact secret name in KV
+              RunAsPreJob: true                               # fetch before other steps
+              # (optional) fail the job if KV is unreachable or secret missing:
+              failIfMissingSecrets: true
+
+          # 2) Use the secret inside your bash script (no plain text)
+          - task: AzureCLI@2
+            displayName: 'Ensure Terraform state storage exists'
+            inputs:
+              azureSubscription: '$(serviceConnection)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                # SC_CLIENT_ID is injected via env mapping below (and masked in logs)
+                : "${SC_CLIENT_ID:?Secret 'SC-CLIENT-ID' not found. Check Key Vault name/permissions.}"
+
+                echo "Using SC_CLIENT_ID from Key Vault (redacted)."
+
+                # Example: resolve object id for later role assignments / TF vars
+                PIPELINE_PRINCIPAL_OBJECT_ID="$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)"
+
+                # (Optional) make it available to later steps as a masked pipeline variable
+                #echo "##vso[task.setvariable variable=SC_CLIENT_ID;issecret=true]$SC_CLIENT_ID"
+                echo "##vso[task.setvariable variable=PIPELINE_PRINCIPAL_OBJECT_ID]$PIPELINE_PRINCIPAL_OBJECT_ID"
+            env:
+              # Map the KV secret (pipeline var) to a clean env var name for bash
+              SC_CLIENT_ID: $(SC-CLIENT-ID)
+              #KV_NAME: $(kvName)   # (optional) if you want it in the script too
+
           - task: AzureCLI@2
             displayName: 'Ensure Terraform state storage exists'
             inputs:
@@ -93,15 +131,16 @@ stages:
                   --account-key "$SA_KEY" 1>/dev/null
 
                 # Grant data-plane access to the pipeline principal (for AAD backend)
-                SC_CLIENT_ID="331a5bcb-b95d-4529-a528-c858e28d9a89"
-                PIPELINE_PRINCIPAL_OBJECT_ID="$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv || true)"
+                #SC_CLIENT_ID="331a5bcb-b95d-4529-a528-c858e28d9a89"
+                #PIPELINE_PRINCIPAL_OBJECT_ID="$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv || true)"
+
                 SA_ID="$(az storage account show -g "$RG_STATE" -n "$SA_NAME" --query id -o tsv)"
 
                 if [ -n "${PIPELINE_PRINCIPAL_OBJECT_ID:-}" ] && [ -n "${SA_ID:-}" ]; then
-                az role assignment create \
-                  --assignee-object-id "$PIPELINE_PRINCIPAL_OBJECT_ID" \
-                  --role "Storage Blob Data Contributor" \
-                  --scope "$SA_ID" >/dev/null || true
+                  az role assignment create \
+                    --assignee-object-id "$PIPELINE_PRINCIPAL_OBJECT_ID" \
+                    --role "Storage Blob Data Contributor" \
+                    --scope "$SA_ID" >/dev/null || true
 
                 # small wait for propagation (best-effort)
                 for i in {1..12}; do
@@ -117,6 +156,8 @@ stages:
                 echo "##vso[task.setvariable variable=TFSTATE_RG]$RG_STATE"
                 echo "##vso[task.setvariable variable=TFSTATE_SA]$SA_NAME"
                 echo "##vso[task.setvariable variable=TFSTATE_CONTAINER]$SA_CONTAINER"
+            env:
+              PIPELINE_PRINCIPAL_OBJECT_ID: $(PIPELINE_PRINCIPAL_OBJECT_ID)
 
           - task: AzureCLI@2
             displayName: 'Login + tools + plan/apply (dev)'

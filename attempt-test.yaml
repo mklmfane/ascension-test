@@ -111,13 +111,27 @@ stages:
 
                 TF_DIR="$(Build.SourcesDirectory)/terraform"
 
-                # --- Optional lint (kept minimal here) ---
+                # --- Optional lint (best-effort) ---
                 BIN_DIR="$(Agent.TempDirectory)/bin"; mkdir -p "$BIN_DIR"; export PATH="$BIN_DIR:$PATH"
                 tflint --init && tflint --recursive || true
-                tfsec "$TF_DIR" || true
+                if command -v tfsec >/dev/null 2>&1; then
+                  tfsec "$TF_DIR" || true
+                else
+                  echo "tfsec not installed; skipping."
+                fi
 
-                # --- Init + workspace (create only if missing) ---
-                terraform -chdir="$TF_DIR" init -input=false
+                # --- Ensure backend exists + initialize REMOTE backend up-front ---
+                if ! grep -R 'backend *"azurerm"' -n "$TF_DIR" >/dev/null 2>&1; then
+                  echo 'terraform { backend "azurerm" {} }' > "$TF_DIR/zz_backend.auto.tf"
+                fi
+
+                terraform -chdir="$TF_DIR" init -input=false -reconfigure \
+                  -backend-config="resource_group_name=$(TFSTATE_RG)" \
+                  -backend-config="storage_account_name=$(TFSTATE_SA)" \
+                  -backend-config="container_name=$(TFSTATE_CONTAINER)" \
+                  -backend-config="key=terraform.$(env).tfstate"
+
+                # --- Workspace (create/select) ---
                 ensure_ws() {
                   local dir="$1" ws="$2"
                   if terraform -chdir="$dir" workspace list | sed 's/*//;s/ //g' | grep -Fxq "$ws"; then
@@ -131,13 +145,20 @@ stages:
                 # --- Import-if-exists guard for Resource Group (idempotent) ---
                 SUB_ID=$(az account show --query id -o tsv)
                 RG_NAME="$(RG_NAME_PREFIX)-$(env)-rg"
-                if az group exists -n "$RG_NAME"; then
-                  if ! terraform -chdir="$TF_DIR" state show azurerm_resource_group.ascension_test_rg >/dev/null 2>&1; then
-                    terraform -chdir="$TF_DIR" import azurerm_resource_group.ascension_test_rg "/subscriptions/$SUB_ID/resourceGroups/$RG_NAME" || true
+
+                if az group exists -n "$RG_NAME" >/dev/null; then
+                  # Determine correct address (handle count => [0])
+                  RG_ADDR="azurerm_resource_group.ascension_test_rg"
+                  if grep -R 'resource *"azurerm_resource_group" *"ascension_test_rg"' -n -A6 "$TF_DIR" | grep -q 'count'; then
+                    RG_ADDR="${RG_ADDR}[0]"
                   fi
+
+                if ! terraform -chdir="$TF_DIR" state show "$RG_ADDR" >/dev/null 2>&1; then
+                  terraform -chdir="$TF_DIR" import "$RG_ADDR" "/subscriptions/$SUB_ID/resourceGroups/$RG_NAME" || true
+                fi
                 fi
 
-                # --- Resolve pipeline principal object id you pass to TF ---
+                # --- Resolve pipeline principal object id passed to TF ---
                 SC_CLIENT_ID="331a5bcb-b95d-4529-a528-c858e28d9a89"
                 PIPELINE_PRINCIPAL_OBJECT_ID=$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)
 
@@ -154,6 +175,7 @@ stages:
                 terraform -chdir="$TF_DIR" apply -auto-approve -no-color "tfplan.phase1.$(env).out"
 
                 # Wait for KV to be queryable
+                RG_NAME="$(RG_NAME_PREFIX)-$(env)-rg"
                 echo "Waiting for Key Vault to be queryable..."
                 for i in {1..10}; do
                   KV_ID=$(az keyvault list -g "$RG_NAME" \
@@ -165,51 +187,29 @@ stages:
                 fi
                 echo "KV_ID=$KV_ID"
 
-                # =========================================================
                 # Import-if-exists guards for KV role assignments
-                # =========================================================
                 TF_ADDR_SELF="module.app_service.azurerm_role_assignment.kv_secrets_officer_self"
                 TF_ADDR_PIPE="module.app_service.azurerm_role_assignment.kv_secrets_officer_pipeline[0]"
                 ROLE_NAME="Key Vault Secrets Officer"
 
                 SELF_OBJECT_ID=$(az ad signed-in-user show --query id -o tsv 2>/dev/null || true)
-                if [ -z "${SELF_OBJECT_ID:-}" ]; then
-                  SELF_OBJECT_ID=$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv 2>/dev/null || true)
-                fi
+                [ -z "${SELF_OBJECT_ID:-}" ] && SELF_OBJECT_ID=$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv 2>/dev/null || true)
 
                 if [ -n "${SELF_OBJECT_ID:-}" ]; then
-                  EXIST_SELF=$(az role assignment list \
-                  --assignee-object-id "$SELF_OBJECT_ID" \
-                  --scope "$KV_ID" \
-                  --role "$ROLE_NAME" \
-                  --query "[0].id" -o tsv || true)
-                  if [ -n "$EXIST_SELF" ]; then
-                    echo "Importing existing KV role assignment (self): $EXIST_SELF"
-                    terraform -chdir="$TF_DIR" import "$TF_ADDR_SELF" "$EXIST_SELF" || true
-                  fi
+                  EXIST_SELF=$(az role assignment list --assignee-object-id "$SELF_OBJECT_ID" --scope "$KV_ID" --role "$ROLE_NAME" --query "[0].id" -o tsv || true)
+                  [ -n "$EXIST_SELF" ] && terraform -chdir="$TF_DIR" import "$TF_ADDR_SELF" "$EXIST_SELF" || true
                 fi
 
                 if [ -n "${PIPELINE_PRINCIPAL_OBJECT_ID:-}" ] && [ "${PIPELINE_PRINCIPAL_OBJECT_ID}" != "null" ]; then
-                  EXIST_PIPE=$(az role assignment list \
-                    --assignee-object-id "$PIPELINE_PRINCIPAL_OBJECT_ID" \
-                    --scope "$KV_ID" \
-                    --role "$ROLE_NAME" \
-                    --query "[0].id" -o tsv || true)
-                  if [ -n "$EXIST_PIPE" ]; then
-                    echo "Importing existing KV role assignment (pipeline): $EXIST_PIPE"
-                    terraform -chdir="$TF_DIR" import "$TF_ADDR_PIPE" "$EXIST_PIPE" || true
-                  fi
+                  EXIST_PIPE=$(az role assignment list --assignee-object-id "$PIPELINE_PRINCIPAL_OBJECT_ID" --scope "$KV_ID" --role "$ROLE_NAME" --query "[0].id" -o tsv || true)
+                  [ -n "$EXIST_PIPE" ] && terraform -chdir="$TF_DIR" import "$TF_ADDR_PIPE" "$EXIST_PIPE" || true
                 fi
 
                 # =========================================================
-                # Phase 2: Full plan/apply
+                # Phase 2: Full plan/apply (backend already remote)
                 # =========================================================
                 echo ">>> Phase 2: full plan/apply"
                 terraform -chdir="$TF_DIR" plan -no-color -input=false \
-                  -backend-config="resource_group_name=$(TFSTATE_RG)" \
-                  -backend-config="storage_account_name=$(TFSTATE_SA)" \
-                  -backend-config="container_name=$(TFSTATE_CONTAINER)" \
-                  -backend-config="key=terraform.$(env).tfstate" \
                   -var="workflow=$(env)" \
                   -var="pipeline_principal_id=$PIPELINE_PRINCIPAL_OBJECT_ID" \
                   -var="frontend_image_name=frontend-$(env)" \

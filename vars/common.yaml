@@ -1,5 +1,5 @@
 variables:
-  serviceConnection: 'terraform-access'
+  serviceConnection: 'subscription-test-plan(2651642d-e8bb-4270-8616-ca051b63d71e)'
   GO_VERSION: '1.24.5'
   TFSEC_VERSION: 'v1.28.14'
   TFLINT_VERSION: 'v0.59.1'

@@ -1,13 +1,15 @@
 # ===========================
-# Stage 0: fetch SC + App Registration values with System.AccessToken
+# Stage 0: fetch SC + App Registration values
 # ===========================
 stages:
 - stage: GetAppClientId
-  displayName: "Inspect Service Connection (ADO token only)"
+  displayName: "Inspect Service Connection or App Registration"
   variables:
     ORG_URL: "https://dev.azure.com/mirceaconstantin434/"
     PROJECT: "test-ascendion"
-    SC_NAME: "aa6ed1ea-8f71-42e9-962e-8a2122f3ac66"   # display name OR the GUID
+    # Pass EITHER a Service Connection DISPLAY NAME / SERVICE-ENDPOINT ID
+    # OR an AAD App OBJECT ID (GUID). The logic below handles both.
+    SC_NAME: "terrraform-access"
 
   jobs:
   - job: FetchValues
@@ -16,86 +18,117 @@ stages:
       name: 'ubuntuvm'
 
     steps:
+    # -- Step 1: Try to resolve as a DevOps service connection using System.AccessToken
     - bash: |
         set -euo pipefail
 
-        # Ensure the OAuth token is available to az devops
+        # Ensure OAuth token available for az devops
         if [ -z "${AZURE_DEVOPS_EXT_PAT:-}" ]; then
           echo "##vso[task.logissue type=error]System.AccessToken is empty. Enable 'Allow scripts to access the OAuth token' in Pipeline settings."
           exit 1
         fi
 
-
         ORG_URL="$(echo '$(ORG_URL)')"
         PROJECT="$(echo '$(PROJECT)')"
         SC_NAME="$(echo '$(SC_NAME)')"
 
-        # Prepare CLI
         az extension add --name azure-devops >/dev/null 2>&1 || true
         if ! command -v jq >/dev/null 2>&1; then
           sudo apt-get update -y
           sudo apt-get install -y jq
         fi
 
-        # --- Robust service connection resolution with diagnostics ---
         echo "Looking for service connection using SC_NAME='${SC_NAME}' in project '${PROJECT}'..."
 
-        SC_LIST_JSON=$(az devops service-endpoint list --organization "$ORG_URL" --project "$PROJECT" -o json)
-        if [[ -z "$SC_LIST_JSON" || "$SC_LIST_JSON" == "null" ]]; then
-          echo "##vso[task.logissue type=error]Could not list service connections in project '$PROJECT'."
-          exit 2
-        fi
-
+        # Attempt to list service connections (may be empty if none/permissions)
+        SC_LIST_JSON=$(az devops service-endpoint list --organization "$ORG_URL" --project "$PROJECT" -o json 2>/dev/null || echo "[]")
         echo "Available service connections (name → id):"
-        echo "$SC_LIST_JSON" | jq -r '.[] | "\(.name) → \(.id)"' | sed 's/^/  - /'
+        echo "$SC_LIST_JSON" | jq -r '.[] | "\(.name) → \(.id)"' | sed 's/^/  - /' || true
 
-        # 1) Exact name match
+        # 1) Exact name
         SC_JSON=$(echo "$SC_LIST_JSON" | jq --arg n "$SC_NAME" -r '[.[] | select(.name == $n)] | .[0] // empty')
-
-        # 2) Case-insensitive name match
+        # 2) Case-insensitive
         if [[ -z "$SC_JSON" ]]; then
           SC_JSON=$(echo "$SC_LIST_JSON" | jq --arg n "$SC_NAME" -r \
             '[.[] | select((.name|ascii_downcase) == ($n|ascii_downcase))] | .[0] // empty')
         fi
-
-        # 3) Treat SC_NAME as ID (GUID)
+        # 3) Treat SC_NAME as a service-endpoint ID (GUID)
         if [[ -z "$SC_JSON" && "$SC_NAME" =~ ^[0-9a-fA-F-]{36}$ ]]; then
-          echo "No name match; trying to resolve as ID..."
+          echo "No name match; trying to resolve as service-endpoint ID..."
           SC_JSON=$(az devops service-endpoint show --organization "$ORG_URL" --project "$PROJECT" --id "$SC_NAME" -o json 2>/dev/null || true)
         fi
 
-        if [[ -z "$SC_JSON" || "$SC_JSON" == "null" ]]; then
-          echo "##vso[task.logissue type=error]Service connection '$SC_NAME' not found in '$PROJECT'."
-          echo "Tip: copy the exact display name from Project settings → Service connections, or pass its ID (GUID)."
-          exit 2
-        fi
+        # Extract fields (may be empty if this is not a service connection)
+        SC_ID=$(echo "${SC_JSON:-}" | jq -r '.id // empty')
+        SC_TYPE=$(echo "${SC_JSON:-}" | jq -r '.type // empty')
+        SC_URL=$(echo "${SC_JSON:-}" | jq -r '.url // empty')
+        AUTH_SCHEME=$(echo "${SC_JSON:-}" | jq -r '.authorization.scheme // "N/A"')
+        SUBSCRIPTION_ID=$(echo "${SC_JSON:-}" | jq -r '.data.subscriptionId // "N/A"')
+        APP_CLIENT_ID=$(echo "${SC_JSON:-}" | jq -r '.authorization.parameters.serviceprincipalid // empty')
+        TENANT_ID=$(echo "${SC_JSON:-}" | jq -r '.authorization.parameters.tenantid // .data.scopeTenantId // empty')
 
-        # Extract fields
-        SC_ID=$(echo "$SC_JSON" | jq -r '.id')
-        SC_TYPE=$(echo "$SC_JSON" | jq -r '.type')
-        SC_URL=$(echo "$SC_JSON" | jq -r '.url')
-        AUTH_SCHEME=$(echo "$SC_JSON" | jq -r '.authorization.scheme // "N/A"')
-        SUBSCRIPTION_ID=$(echo "$SC_JSON" | jq -r '.data.subscriptionId // "N/A"')
-        APP_CLIENT_ID=$(echo "$SC_JSON" | jq -r '.authorization.parameters.serviceprincipalid // empty')
-        TENANT_ID=$(echo "$SC_JSON" | jq -r '.authorization.parameters.tenantid // .data.scopeTenantId // empty')
-
-        echo "ID:                 $SC_ID"
-        echo "Type:               $SC_TYPE"
-        echo "URL:                $SC_URL"
-        echo "Auth Scheme:        $AUTH_SCHEME"
-        echo "Subscription ID:    $SUBSCRIPTION_ID"
+        echo "ID:                 ${SC_ID:-<empty>}"
+        echo "Type:               ${SC_TYPE:-<empty>}"
+        echo "URL:                ${SC_URL:-<empty>}"
+        echo "Auth Scheme:        ${AUTH_SCHEME:-<empty>}"
+        echo "Subscription ID:    ${SUBSCRIPTION_ID:-<empty>}"
         echo "Application (client) ID: ${APP_CLIENT_ID:-<empty>}"
         echo "Tenant ID:          ${TENANT_ID:-<empty>}"
 
-        # Output variables for downstream jobs/stages
-        echo "##vso[task.setvariable variable=serviceConnectionId;isOutput=true]$SC_ID"
-        echo "##vso[task.setvariable variable=serviceConnectionType;isOutput=true]$SC_TYPE"
-        echo "##vso[task.setvariable variable=serviceConnectionUrl;isOutput=true]$SC_URL"
-        echo "##vso[task.setvariable variable=authScheme;isOutput=true]$AUTH_SCHEME"
-        echo "##vso[task.setvariable variable=subscriptionId;isOutput=true]$SUBSCRIPTION_ID"
-        echo "##vso[task.setvariable variable=appClientId;isOutput=true]$APP_CLIENT_ID"
-        echo "##vso[task.setvariable variable=tenantId;isOutput=true]$TENANT_ID"
+        # Export (may be empty if not a service connection)
+        echo "##vso[task.setvariable variable=serviceConnectionId;isOutput=true]${SC_ID}"
+        echo "##vso[task.setvariable variable=serviceConnectionType;isOutput=true]${SC_TYPE}"
+        echo "##vso[task.setvariable variable=serviceConnectionUrl;isOutput=true]${SC_URL}"
+        echo "##vso[task.setvariable variable=authScheme;isOutput=true]${AUTH_SCHEME}"
+        echo "##vso[task.setvariable variable=subscriptionId;isOutput=true]${SUBSCRIPTION_ID}"
+        echo "##vso[task.setvariable variable=appClientId;isOutput=true]${APP_CLIENT_ID}"
+        echo "##vso[task.setvariable variable=tenantId;isOutput=true]${TENANT_ID}"
+
+        # Also surface SC_NAME so the next step can use it if needed
+        echo "##vso[task.setvariable variable=inputIdOrName]${SC_NAME}"
       name: fetchservice
       env:
-        # Use the pipeline OAuth token for 'az devops'
         AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+
+    # -- Step 2 (optional): If appClientId is still empty, and you actually passed
+    #                        an AAD App OBJECT ID as SC_NAME, resolve it via Azure Graph.
+    # Provide an ARM service connection in variable $(serviceConnectionForLogin) to enable this.
+    - task: AzureCLI@2
+      displayName: "Fallback: resolve App Registration appId via Azure login (optional)"
+      condition: and(succeeded(), eq(variables['appClientId'], ''))
+      inputs:
+        azureSubscription: '$(serviceConnectionForLogin)'   # <-- set this pipeline var to an ARM service connection name
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+
+          IN="$(inputIdOrName)"
+          if [[ -z "$IN" ]]; then
+            echo "No input id/name present; skipping."
+            exit 0
+          fi
+
+          # If the input looks like a GUID, try to resolve as AAD App OBJECT ID → appId
+          if [[ "$IN" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+            echo "Treating '${IN}' as AAD App OBJECT ID. Resolving appId..."
+            if ! command -v jq >/dev/null 2>&1; then
+              sudo apt-get update -y && sudo apt-get install -y jq
+            fi
+
+            APP_JSON=$(az ad app show --id "$IN" -o json 2>/dev/null || true)
+            if [[ -z "$APP_JSON" || "$APP_JSON" == "null" ]]; then
+              echo "Could not resolve App Registration by objectId=${IN} (insufficient rights or wrong tenant?)."
+              exit 0
+            fi
+
+            APPID=$(echo "$APP_JSON" | jq -r '.appId // empty')
+            if [[ -n "$APPID" ]]; then
+              echo "Resolved Application (client) ID from App Registration: $APPID"
+              echo "##vso[task.setvariable variable=appClientId;isOutput=true]$APPID"
+            else
+              echo "App found but appId missing."
+            fi
+          else
+            echo "Input does not look like a GUID; skipping Graph fallback."
+          fi

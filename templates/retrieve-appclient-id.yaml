@@ -7,7 +7,7 @@ stages:
   variables:
     ORG_URL: "https://dev.azure.com/mirceaconstantin434/"
     PROJECT: "test-ascendion"
-    SC_NAME: "terraform-access"   # display name OR the GUID
+    SC_NAME: "aa6ed1ea-8f71-42e9-962e-8a2122f3ac66"   # display name OR the GUID
 
   jobs:
   - job: FetchValues
@@ -94,7 +94,7 @@ stages:
         echo "##vso[task.setvariable variable=subscriptionId;isOutput=true]$SUBSCRIPTION_ID"
         echo "##vso[task.setvariable variable=appClientId;isOutput=true]$APP_CLIENT_ID"
         echo "##vso[task.setvariable variable=tenantId;isOutput=true]$TENANT_ID"
-      name: fetch
+      name: fetch-service-connection-id
       env:
         # Use the pipeline OAuth token for 'az devops'
         AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)

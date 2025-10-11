@@ -97,7 +97,7 @@ stages:
       displayName: "Fallback: resolve App Registration appId via Azure login (optional)"
       condition: and(succeeded(), eq(variables['appClientId'], ''))
       inputs:
-        azureSubscription: '$(serviceConnectionForLogin)'   # <-- set this pipeline var to an ARM service connection name
+        azureSubscription: '$(serviceConnection)'   # <-- set this pipeline var to an ARM service connection name
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |

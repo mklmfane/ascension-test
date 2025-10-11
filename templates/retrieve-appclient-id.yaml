@@ -1,6 +1,7 @@
 # ===========================
 # Stage 0: fetch SC + App Registration values with System.AccessToken
 # ===========================
+stages:
 - stage: GetAppClientId
   displayName: "Inspect Service Connection (ADO token only)"
   variables:

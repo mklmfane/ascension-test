@@ -12,9 +12,7 @@ stages:
   - job: FetchValues
     displayName: "Fetch SC + App values"
     pool: { name: 'ubuntuvm' }
-    permissions:
-      pipelines:
-        accessToken: true
+
     steps:
       - bash: |
           set -euo pipefail

@@ -1,0 +1,71 @@
+# ===========================
+# Stage 0: fetch SC + App Registration values with System.AccessToken
+# ===========================
+- stage: GetAppClientId
+  displayName: "Inspect Service Connection (ADO token only)"
+  variables:
+    ORG_URL: "https://dev.azure.com/mirceaconstantin434/"
+    PROJECT: "test-ascendion"
+    SC_NAME: "$(serviceConnection)"
+  jobs:
+  - job: FetchValues
+    displayName: "Fetch SC + App values"
+    pool: { name: 'ubuntuvm' }
+    permissions:
+      pipelines:
+        accessToken: true
+    steps:
+      - bash: |
+          set -euo pipefail
+
+          ORG_URL="$(echo '$(ORG_URL)')"
+          PROJECT="$(echo '$(PROJECT)')"
+          SC_NAME="$(echo '$(SC_NAME)')"
+
+          # Prepare CLI
+          az extension add --name azure-devops >/dev/null 2>&1 || true
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y jq
+          fi
+
+          # Query service connection by NAME using ADO token
+          SC_JSON=$(az devops service-endpoint list \
+            --organization "$ORG_URL" \
+            --project "$PROJECT" \
+            --query "[?name=='$SC_NAME'] | [0]" -o json)
+
+          if [[ -z "$SC_JSON" || "$SC_JSON" == "null" ]]; then
+            echo "##vso[task.logissue type=error]Service connection '$SC_NAME' not found in '$(PROJECT)'."
+            exit 2
+          fi
+
+          # Extract fields
+          SC_ID=$(echo "$SC_JSON" | jq -r '.id')
+          SC_TYPE=$(echo "$SC_JSON" | jq -r '.type')
+          SC_URL=$(echo "$SC_JSON" | jq -r '.url')
+          AUTH_SCHEME=$(echo "$SC_JSON" | jq -r '.authorization.scheme // "N/A"')
+          SUBSCRIPTION_ID=$(echo "$SC_JSON" | jq -r '.data.subscriptionId // "N/A"')
+          APP_CLIENT_ID=$(echo "$SC_JSON" | jq -r '.authorization.parameters.serviceprincipalid // empty')
+          TENANT_ID=$(echo "$SC_JSON" | jq -r '.authorization.parameters.tenantid // .data.scopeTenantId // empty')
+
+          echo "ID:                 $SC_ID"
+          echo "Type:               $SC_TYPE"
+          echo "URL:                $SC_URL"
+          echo "Auth Scheme:        $AUTH_SCHEME"
+          echo "Subscription ID:    $SUBSCRIPTION_ID"
+          echo "Application (client) ID: $APP_CLIENT_ID"
+          echo "Tenant ID:          $TENANT_ID"
+
+          # Output variables for downstream jobs/stages
+          echo "##vso[task.setvariable variable=serviceConnectionId;isOutput=true]$SC_ID"
+          echo "##vso[task.setvariable variable=serviceConnectionType;isOutput=true]$SC_TYPE"
+          echo "##vso[task.setvariable variable=serviceConnectionUrl;isOutput=true]$SC_URL"
+          echo "##vso[task.setvariable variable=authScheme;isOutput=true]$AUTH_SCHEME"
+          echo "##vso[task.setvariable variable=subscriptionId;isOutput=true]$SUBSCRIPTION_ID"
+          echo "##vso[task.setvariable variable=appClientId;isOutput=true]$APP_CLIENT_ID"
+          echo "##vso[task.setvariable variable=tenantId;isOutput=true]$TENANT_ID"
+        name: fetch
+        env:
+          # Use pipeline access token for 'az devops'
+          AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)

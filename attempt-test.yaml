@@ -13,24 +13,20 @@ parameters:
 
 # Global vars
 variables:
-  serviceConnection: 'terraform-access'
-  GO_VERSION: '1.24.5'
-  TFSEC_VERSION: 'v1.28.14'
-  TFLINT_VERSION: 'v0.59.1'
-  doDestroy: true
-  RG_NAME_PREFIX: 'ascension-up'
-  location: 'northeurope'
-  kvName: 'vault-access-key-access' 
+- template: vars/common.yaml
+
 
 # ===========================
 # Stages generated per env
 # ===========================
 stages:
+# Add this stage to get the value of application client id
+- template: templates/retrieve-appclient-id.yaml
+
 # Loop must be under "stages:"
 - ${{ each x in parameters.envs }}:
   - stage: ${{ x.name }}
     displayName: '${{ upper(x.name) }}'
-    
     
     ${{ if eq(x.name, 'test') }}:
       dependsOn: dev
@@ -50,132 +46,13 @@ stages:
           - checkout: self
             clean: true
           
-          # 1) Read SC-CLIENT-ID from the vault and expose it as a masked var
-          - task: AzureCLI@2
-            displayName: 'Get SC_CLIENT_ID from Key Vault'
-            inputs:
-              azureSubscription: '$(serviceConnection)'   # your WIF connection
-              scriptType: bash
-              scriptLocation: inlineScript
-              inlineScript: |
-                set -euo pipefail
-                set +x  # never echo secrets
-
-                KV_NAME='vault-access-keys'         # <— use the real name here (or set variables.kvName and use it)
-                SECRET_NAME='SC-CLIENT-ID'
-
-                # Fetch clientId stored as secret (RBAC: Key Vault Secrets User)
-                SC_CLIENT_ID="$(az keyvault secret show \
-                  --vault-name "$KV_NAME" \
-                  --name "$SECRET_NAME" \
-                  --query value -o tsv)"
-                [ -n "$SC_CLIENT_ID" ] || { echo "Secret $SECRET_NAME not found in $KV_NAME"; exit 1; }
-
-                # Resolve the service principal's objectId (OID)
-                OID="$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)"
-                [ -n "$OID" ] || { echo "Could not resolve objectId for clientId from KV"; exit 1; }
-
-                # Publish for later tasks (SC_CLIENT_ID masked; OID is safe)
-                echo "##vso[task.setvariable variable=SC_CLIENT_ID;issecret=true]$SC_CLIENT_ID"
-                echo "##vso[task.setvariable variable=PIPELINE_PRINCIPAL_OBJECT_ID]$OID"
-
-          #- task: AzureKeyVault@2
-          #  name: fetch_kv_secrets
-          #  displayName: 'Fetch SC_CLIENT_ID from Key Vault'
-          #  inputs:
-          #    azureSubscription: '$(serviceConnection)'       # your WIF service connection
-          #    KeyVaultName: '$(kvName)'
-          #    SecretsFilter: 'SC-CLIENT-ID'                   # the exact secret name in KV
-          #    RunAsPreJob: true                               # fetch before other steps
-              # (optional) fail the job if KV is unreachable or secret missing:
-          #    failIfMissingSecrets: true
-
-          - task: AzureCLI@2
-            inputs:
-              azureSubscription: '$(serviceConnection)'
-              scriptType: bash
-              scriptLocation: inlineScript
-              inlineScript: |
-                set -euo pipefail
-                set +x  # never echo secrets
-
-                SUB_ID="$(az account show --query id -o tsv)"
-                KV_NAME="${KV_NAME:-}"
-                if [ -z "$KV_NAME" ]; then
-                  echo "ERROR: KV_NAME is empty. Set variables.kvName or pass env KV_NAME." >&2
-                  exit 1
-                fi
-
-                echo "Looking for Key Vault '$KV_NAME' in subscription $SUB_ID ..."
-                if ! az keyvault show -n "$KV_NAME" -o none 2>/dev/null; then
-                  echo "ERROR: Vault '$KV_NAME' not found in subscription $SUB_ID." >&2
-                  echo "Available vaults in this subscription:" >&2
-                  az keyvault list --query "[].{name:name, rg:resourceGroup, location:location}" -o table || true
-                  echo "If your vault is in a different subscription, point the service connection to that subscription." >&2
-                  exit 1
-                fi
-
-                # Fetch the clientId stored as secret
-                SC_CLIENT_ID="$(az keyvault secret show \
-                  --vault-name "$KV_NAME" \
-                  --name 'SC-CLIENT-ID' \
-                  --query value -o tsv --only-show-errors)"
-
-                if [ -z "${SC_CLIENT_ID:-}" ]; then
-                  echo "ERROR: Secret 'SC-CLIENT-ID' not found or empty in vault '$KV_NAME'." >&2
-                  exit 1
-                fi
-
-                # Resolve service principal objectId for later role assignments / TF vars
-                OID="$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv --only-show-errors || true)"
-                if [ -z "${OID:-}" ]; then
-                  echo "ERROR: Could not resolve AAD objectId for clientId from Key Vault." >&2
-                  exit 1
-                fi
-
-                # Export for later tasks (no need to persist SC_CLIENT_ID)
-                echo "##vso[task.setvariable variable=PIPELINE_PRINCIPAL_OBJECT_ID]$OID"
-            env:
-              KV_NAME: $(kvName)
-
-          # 2) Use the secret inside your bash script (no plain text)
-          - task: AzureCLI@2
-            name: resolve_sp_oid
-            displayName: 'Resolve pipeline principal OID from Key Vault (fast)'
-            inputs:
-              azureSubscription: '$(serviceConnection)'
-              scriptType: bash
-              scriptLocation: inlineScript
-              inlineScript: |
-                set -euo pipefail
-                # IMPORTANT: never echo secrets; also make sure xtrace is off
-                set +x
-
-                # Expect KV name via env var mapping below
-                : "${KV_NAME:?Set pipeline variable kvName or env KV_NAME}"
-
-                echo "Fetching SC-CLIENT-ID from Key Vault '$KV_NAME'…"
-                SC_CLIENT_ID="$(az keyvault secret show \
-                  --vault-name "$KV_NAME" \
-                  --name "SC-CLIENT-ID" \
-                  --query value -o tsv --only-show-errors)"
-
-                if [ -z "${SC_CLIENT_ID:-}" ]; then
-                  echo "ERROR: Secret 'SC-CLIENT-ID' not found or empty in vault '$KV_NAME'." >&2
-                  exit 1
-                fi
-
-                # Resolve AAD objectId of the service principal
-                PIPELINE_PRINCIPAL_OBJECT_ID="$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv --only-show-errors)"
-                if [ -z "${PIPELINE_PRINCIPAL_OBJECT_ID:-}" ]; then
-                  echo "ERROR: Could not resolve objectId for clientId from Key Vault." >&2
-                  exit 1
-                fi
-
-                # Expose to later tasks (no need to persist the clientId)
-                echo "##vso[task.setvariable variable=PIPELINE_PRINCIPAL_OBJECT_ID]$PIPELINE_PRINCIPAL_OBJECT_ID"
-            env:
-              KV_NAME: $(kvName)
+          # (Optional) Show the values we received
+          - bash: |
+              echo "Env: $(env)"
+              echo "App Client ID: $(appClientId)"
+              echo "Subscription ID: $(subscriptionId)"
+              echo "Tenant ID: $(tenantId)"
+            displayName: "Echo inputs" 
 
           - task: AzureCLI@2
             displayName: 'Ensure Terraform state storage exists'
@@ -226,6 +103,13 @@ stages:
 
                 SA_ID="$(az storage account show -g "$RG_STATE" -n "$SA_NAME" --query id -o tsv)"
 
+                # Resolve the pipeline principal OBJECT ID from the clientId (needs Azure context from this task)
+                if [[ -n "${APP_CLIENT_ID:-}" ]]; then
+                  PIPELINE_PRINCIPAL_OBJECT_ID="$(az ad sp show --id "$APP_CLIENT_ID" --query id -o tsv 2>/dev/null || true)"
+                else
+                  PIPELINE_PRINCIPAL_OBJECT_ID=""
+                fi
+
                 if [ -n "${PIPELINE_PRINCIPAL_OBJECT_ID:-}" ] && [ -n "${SA_ID:-}" ]; then
                   az role assignment create \
                     --assignee-object-id "$PIPELINE_PRINCIPAL_OBJECT_ID" \
@@ -247,7 +131,7 @@ stages:
                 echo "##vso[task.setvariable variable=TFSTATE_SA]$SA_NAME"
                 echo "##vso[task.setvariable variable=TFSTATE_CONTAINER]$SA_CONTAINER"
             env:
-              PIPELINE_PRINCIPAL_OBJECT_ID: $(PIPELINE_PRINCIPAL_OBJECT_ID)
+              APP_CLIENT_ID: $(appClientId)
 
           - task: AzureCLI@2
             displayName: 'Login + tools + plan/apply (dev)'

@@ -1,0 +1,9 @@
+variables:
+  serviceConnection: 'terraform-access'
+  GO_VERSION: '1.24.5'
+  TFSEC_VERSION: 'v1.28.14'
+  TFLINT_VERSION: 'v0.59.1'
+  doDestroy: true
+  RG_NAME_PREFIX: 'ascension-up'
+  location: 'northeurope'
+

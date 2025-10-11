@@ -25,7 +25,7 @@ stages:
   parameters:
     orgUrl: "https://dev.azure.com/mirceaconstantin434/"
     project: "test-ascendion"
-    scInput: "aa6ed1ea-8f71-42e9-962e-8a2122f3ac66"  
+    scInput: "$(serviceConnection)" # <-- your DevOps service connection name here  
 
 # Loop must be under "stages:"
 - ${{ each x in parameters.envs }}:

@@ -1,4 +1,6 @@
-# templates/get-app-client-id.yaml
+# Simple, self-contained stage template that only uses System.AccessToken
+# No compile-time conditionals here (keeps the parser happy)
+
 parameters:
 - name: orgUrl
   type: string
@@ -6,12 +8,7 @@ parameters:
 - name: project
   type: string
   default: "test-ascendion"
-# Pass EITHER a DevOps Service Connection name/ID OR an AAD App OBJECT ID
-- name: scInput
-  type: string
-  default: ""
-# Optional ARM service connection for Graph fallback (resolve AAD appId)
-- name: serviceConnectionForLogin
+- name: scInput          # service connection name/ID OR AAD app objectId
   type: string
   default: ""
 
@@ -26,7 +23,8 @@ stages:
   jobs:
   - job: FetchValues
     displayName: "Fetch SC + App values"
-    pool: { name: 'ubuntuvm' }
+    pool:
+      name: 'ubuntuvm'
 
     steps:
     - bash: |
@@ -54,18 +52,20 @@ stages:
         echo "Available service connections (name → id):"
         echo "$SC_LIST_JSON" | jq -r '.[] | "\(.name) → \(.id)"' | sed 's/^/  - /' || true
 
-        # Try resolve as DevOps service connection (name / case-insensitive / GUID id)
+        # 1) Exact name
         SC_JSON=$(echo "$SC_LIST_JSON" | jq --arg n "$SC_NAME" -r '[.[] | select(.name == $n)] | .[0] // empty')
+        # 2) Case-insensitive name
         if [[ -z "$SC_JSON" ]]; then
           SC_JSON=$(echo "$SC_LIST_JSON" | jq --arg n "$SC_NAME" -r \
             '[.[] | select((.name|ascii_downcase) == ($n|ascii_downcase))] | .[0] // empty')
         fi
+        # 3) Treat SC_NAME as service-endpoint ID (GUID)
         if [[ -z "$SC_JSON" && "$SC_NAME" =~ ^[0-9a-fA-F-]{36}$ ]]; then
           echo "No name match; trying to resolve as service-endpoint ID..."
           SC_JSON=$(az devops service-endpoint show --organization "$ORG_URL" --project "$PROJECT" --id "$SC_NAME" -o json 2>/dev/null || true)
         fi
 
-        # Extract (may be empty if SC_NAME is actually an AAD Object ID)
+        # Extract (may be empty if SC_NAME is actually an AAD App Object ID)
         SC_ID=$(echo "${SC_JSON:-}" | jq -r '.id // empty')
         SC_TYPE=$(echo "${SC_JSON:-}" | jq -r '.type // empty')
         SC_URL=$(echo "${SC_JSON:-}" | jq -r '.url // empty')
@@ -82,7 +82,7 @@ stages:
         echo "Application (client) ID: ${APP_CLIENT_ID:-<empty>}"
         echo "Tenant ID:          ${TENANT_ID:-<empty>}"
 
-        # Outputs for downstream
+        # Outputs
         echo "##vso[task.setvariable variable=serviceConnectionId;isOutput=true]${SC_ID}"
         echo "##vso[task.setvariable variable=serviceConnectionType;isOutput=true]${SC_TYPE}"
         echo "##vso[task.setvariable variable=serviceConnectionUrl;isOutput=true]${SC_URL}"
@@ -90,44 +90,8 @@ stages:
         echo "##vso[task.setvariable variable=subscriptionId;isOutput=true]${SUBSCRIPTION_ID}"
         echo "##vso[task.setvariable variable=appClientId;isOutput=true]${APP_CLIENT_ID}"
         echo "##vso[task.setvariable variable=tenantId;isOutput=true]${TENANT_ID}"
-
-        # Surface the input for optional fallback step
         echo "##vso[task.setvariable variable=inputIdOrName]${SC_NAME}"
       name: fetch
       env:
         AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
-
-    # Only include this AzureCLI step when a service connection name is provided
-    ${{ if ne(parameters.serviceConnectionForLogin, '') }}:
-    - task: AzureCLI@2
-      displayName: "Fallback: resolve App Registration appId (Graph)"
-      # compile-time inclusion avoids auth validation when not provided
-      inputs:
-        azureSubscription: ${{ parameters.serviceConnectionForLogin }}
-        scriptType: bash
-        scriptLocation: inlineScript
-        inlineScript: |
-          set -euo pipefail
-
-          IN="$(inputIdOrName)"
-          if [[ -z "$IN" ]]; then
-            echo "No input id/name; skipping."
-            exit 0
-          fi
-
-          if ! command -v jq >/dev/null 2>&1; then
-            sudo apt-get update -y && sudo apt-get install -y jq
-          fi
-
-          if [[ "$IN" =~ ^[0-9a-fA-F-]{36}$ ]]; then
-            echo "Treating '${IN}' as AAD App OBJECT ID. Resolving appId via 'az ad app show'..."
-            APPID="$(az ad app show --id "$IN" --query appId -o tsv 2>/dev/null || true)"
-            if [[ -n "$APPID" ]]; then
-              echo "Resolved Application (client) ID: $APPID"
-              echo "##vso[task.setvariable variable=appClientId;isOutput=true]$APPID"
-            else
-              echo "Could not resolve appId (insufficient rights or wrong tenant)."
-            fi
-          else
-            echo "Input is not a GUID; skipping Graph fallback."
-          fi
+      displayName: "Fetch service connection + app registration details"

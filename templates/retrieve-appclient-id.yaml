@@ -95,7 +95,7 @@ stages:
         echo "##vso[task.setvariable variable=subscriptionId;isOutput=true]$SUBSCRIPTION_ID"
         echo "##vso[task.setvariable variable=appClientId;isOutput=true]$APP_CLIENT_ID"
         echo "##vso[task.setvariable variable=tenantId;isOutput=true]$TENANT_ID"
-      name: fetch-service
+      name: fetchservice
       env:
         # Use the pipeline OAuth token for 'az devops'
         AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)

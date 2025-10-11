@@ -13,7 +13,7 @@ parameters:
 # Optional ARM service connection for Graph fallback (resolve AAD appId)
 - name: serviceConnectionForLogin
   type: string
-  default: "aa6ed1ea-8f71-42e9-962e-8a2122f3ac66"
+  default: ""
 
 stages:
 - stage: GetAppClientId

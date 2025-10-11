@@ -25,6 +25,7 @@ stages:
           exit 1
         fi
 
+
         ORG_URL="$(echo '$(ORG_URL)')"
         PROJECT="$(echo '$(PROJECT)')"
         SC_NAME="$(echo '$(SC_NAME)')"

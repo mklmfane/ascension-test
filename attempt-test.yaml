@@ -31,15 +31,21 @@ stages:
 - ${{ each x in parameters.envs }}:
   - stage: ${{ x.name }}
     displayName: '${{ upper(x.name) }}'
-    
+    dependsOn:
+      - GetAppClientId
     ${{ if eq(x.name, 'test') }}:
       dependsOn: dev
       condition: succeeded()
     ${{ if eq(x.name, 'prod') }}:
       dependsOn: test
       condition: succeeded()
+    condition: succeeded()
     variables:
       env: ${{ x.name }}
+      # ⬇️ pull outputs from stage 'GetAppClientId' / job 'FetchValues' / step 'fetch'
+      appClientId:    $[ stageDependencies.GetAppClientId.FetchValues.outputs['fetch.appClientId'] ]
+      subscriptionId: $[ stageDependencies.GetAppClientId.FetchValues.outputs['fetch.subscriptionId'] ]
+      tenantId:       $[ stageDependencies.GetAppClientId.FetchValues.outputs['fetch.tenantId'] ]
     jobs:
 
       # 1) INFRA (${{ x.name }})

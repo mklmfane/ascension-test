@@ -59,15 +59,25 @@ stages:
               scriptLocation: inlineScript
               inlineScript: |
                 set -euo pipefail
-                KV_NAME='vault-access-keys'               # or $(kvName)
-                SECRET_NAME='SC-CLIENT-ID'                # your existing secret name
+                set +x  # never echo secrets
 
-                # Read value via RBAC
-                VAL="$(az keyvault secret show --vault-name "$KV_NAME" --name "$SECRET_NAME" --query value -o tsv)"
-                [ -n "$VAL" ] || { echo "Secret $SECRET_NAME not found in $KV_NAME"; exit 1; }
+                KV_NAME='vault-access-keys'         # <— use the real name here (or set variables.kvName and use it)
+                SECRET_NAME='SC-CLIENT-ID'
 
-                # Publish for later tasks (masked in logs)
-                echo "##vso[task.setvariable variable=SC_CLIENT_ID;issecret=true]$VAL"
+                # Fetch clientId stored as secret (RBAC: Key Vault Secrets User)
+                SC_CLIENT_ID="$(az keyvault secret show \
+                  --vault-name "$KV_NAME" \
+                  --name "$SECRET_NAME" \
+                  --query value -o tsv)"
+                [ -n "$SC_CLIENT_ID" ] || { echo "Secret $SECRET_NAME not found in $KV_NAME"; exit 1; }
+
+                # Resolve the service principal's objectId (OID)
+                OID="$(az ad sp show --id "$SC_CLIENT_ID" --query id -o tsv)"
+                [ -n "$OID" ] || { echo "Could not resolve objectId for clientId from KV"; exit 1; }
+
+                # Publish for later tasks (SC_CLIENT_ID masked; OID is safe)
+                echo "##vso[task.setvariable variable=SC_CLIENT_ID;issecret=true]$SC_CLIENT_ID"
+                echo "##vso[task.setvariable variable=PIPELINE_PRINCIPAL_OBJECT_ID]$OID"
 
           #- task: AzureKeyVault@2
           #  name: fetch_kv_secrets
